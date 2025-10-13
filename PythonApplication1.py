@@ -1,20 +1,27 @@
 # ops_shell.py
-# Unified Operations Shell (ASCII only)
+# Unified Operations Shell (ASCII only, no explicit encodings)
 # ---------------------------------------------------------
-# - PySide6 desktop shell with four tools:
-#     1) SEC OPS: Deep Single Target Inspector
-#     2) Regex Search: Folder-based .txt regex search with highlights
-#     3) File Tools: Selective Copy, Find Large Files, Renumber Files, Convert Dates
-#     4) Builder: OneTouchBuilder for Windows installer creation
-# - Auto-updater retained (checks GitHub version.txt)
-# - Blue/gray high-contrast theme; no LCARS references
+# Tabs:
+#   1) SEC OPS: Deep Single Target Inspector
+#   2) Regex Search: Folder-based .txt regex search with highlights
+#   3) File Tools: Selective Copy, Find Large Files, Renumber Files, Convert Dates
+#   4) Builder: OneTouchBuilder for Windows installer creation
+#   5) Link Verifier: Crawl links, filter by status, color-coded, and report grouping
+#
+# Auto Updater:
+#   - Checks GitHub version.txt vs local version.txt
+#   - Prompts user to update
+#   - Backs up ops_shell.py to ops_shell_backup.py
+#   - Updates ops_shell.py and requirements.txt
+#   - Installs/updates dependencies
+#   - Restarts app on success
 #
 # Requirements:
 #   PySide6
 #   requests
 #   beautifulsoup4
 #   cryptography
-#   (optional) Pillow   # only needed if you want PNG/JPG icons auto-converted to .ico
+#   Pillow (optional, only for Builder icon conversion)
 #
 # Run:
 #   python ops_shell.py
@@ -22,18 +29,16 @@
 from pathlib import Path
 import sys
 import os
-import io
-import zipfile
 import threading
 import socket
 import ssl
 import json
 import datetime
 import re
-import html
 import csv
 import shutil
 import subprocess
+import tempfile
 import urllib.request
 from urllib.parse import urljoin, urlparse
 
@@ -57,22 +62,23 @@ from PySide6 import QtCore, QtGui, QtWidgets
 # Configuration / Versioning
 # ------------------------------
 GITHUB_REPO = "https://github.com/plgraham1/LCARS"
-GITHUB_ZIP_URL = GITHUB_REPO + "/archive/refs/heads/main.zip"
-VERSION_FILE_URL = "https://raw.githubusercontent.com/plgraham1/LCARS/main/version.txt"
-CURRENT_VERSION = "1.5.0"  # internal value only; not shown in UI
+GITHUB_RAW = "https://raw.githubusercontent.com/plgraham1/LCARS/main/"
+LOCAL_VERSION_FILE = "version.txt"
+LOCAL_REQUIREMENTS = "requirements.txt"
+LOCAL_SCRIPT = "ops_shell.py"
 
 
 # ------------------------------
 # Theme (neutral blue/gray)
 # ------------------------------
 class OpsTheme:
-    BG = QtGui.QColor("#11161C")          # app background (dark navy)
-    FG = QtGui.QColor("#E8EDF5")          # main foreground (soft white-blue)
-    PANEL = QtGui.QColor("#1B222C")       # panel background
-    ACCENT = QtGui.QColor("#4A90E2")      # active accent
-    SUBACCENT = QtGui.QColor("#2E3B4A")   # muted divider/rail
+    BG = QtGui.QColor("#11161C")
+    FG = QtGui.QColor("#E8EDF5")
+    PANEL = QtGui.QColor("#1B222C")
+    ACCENT = QtGui.QColor("#4A90E2")
+    SUBACCENT = QtGui.QColor("#2E3B4A")
 
-    BTN_AMBER = QtGui.QColor("#D89E3F")   # button base
+    BTN_AMBER = QtGui.QColor("#D89E3F")
     BTN_AMBER_HOVER = QtGui.QColor("#E8B45D")
     BTN_AMBER_ACTIVE = QtGui.QColor("#F5C469")
 
@@ -82,78 +88,129 @@ class OpsTheme:
 
 
 # ------------------------------
-# Updater
+# Auto Updater (GUI, with backup)
 # ------------------------------
-def check_for_updates(parent_widget=None):
+def _read_local_version():
     try:
-        r = requests.get(VERSION_FILE_URL, timeout=6)
+        with open(LOCAL_VERSION_FILE, "r") as f:
+            return f.read().strip()
+    except Exception:
+        return "0.0.0"
+
+
+def _get_remote_text(filename):
+    try:
+        r = requests.get(GITHUB_RAW + filename, timeout=10)
         if r.status_code == 200:
-            latest = r.text.strip()
-            if latest and latest != CURRENT_VERSION:
-                reply = QtWidgets.QMessageBox.question(
-                    parent_widget,
-                    "Update Available",
-                    f"A new version ({latest}) is available. Update now?",
-                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                )
-                if reply == QtWidgets.QMessageBox.Yes:
-                    download_and_update(parent_widget, latest)
-    except Exception as e:
-        print("Update check failed:", e)
+            return r.text
+    except Exception:
+        pass
+    return None
 
 
-def download_and_update(parent_widget, latest_version):
+def _compare_versions(local, remote):
+    def normalize(v):
+        parts = []
+        for x in v.strip().split("."):
+            try:
+                parts.append(int(x))
+            except Exception:
+                parts.append(0)
+        return parts
     try:
-        r = requests.get(GITHUB_ZIP_URL, timeout=20)
-        r.raise_for_status()
-        z = zipfile.ZipFile(io.BytesIO(r.content))
+        return normalize(remote) > normalize(local)
+    except Exception:
+        return False
 
-        tmpdir = os.path.join(os.getcwd(), "update_tmp")
-        if os.path.exists(tmpdir):
-            import shutil as _sh
-            _sh.rmtree(tmpdir)
-        os.makedirs(tmpdir, exist_ok=True)
 
-        z.extractall(tmpdir)
-        roots = [d for d in os.listdir(tmpdir) if os.path.isdir(os.path.join(tmpdir, d))]
-        if not roots:
-            raise RuntimeError("Downloaded archive appears empty.")
-        root_dir = os.path.join(tmpdir, roots[0])
+def _backup_file(path, backup_path):
+    try:
+        if os.path.exists(path):
+            shutil.copy2(path, backup_path)
+    except Exception:
+        pass
 
-        # Copy top-level files only (simple approach)
-        for name in os.listdir(root_dir):
-            src = os.path.join(root_dir, name)
-            dst = os.path.join(os.getcwd(), name)
-            if os.path.isdir(src):
-                continue
-            with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
-                fdst.write(fsrc.read())
 
-        with open("version.txt", "w", encoding="utf-8") as vf:
-            vf.write(latest_version)
+def _download_and_replace_text_file(filename, remote_text):
+    if remote_text is None:
+        return False
+    try:
+        tmp = tempfile.NamedTemporaryFile(delete=False, mode="w")
+        tmp.write(remote_text)
+        tmp.close()
+        shutil.copy(tmp.name, filename)
+        os.remove(tmp.name)
+        return True
+    except Exception:
+        return False
 
-        QtWidgets.QMessageBox.information(parent_widget, "Update", "Update applied. The app will restart.")
-        restart_program()
+
+def _update_requirements(remote_text, parent=None):
+    if remote_text is None:
+        return
+    try:
+        write = True
+        if os.path.exists(LOCAL_REQUIREMENTS):
+            with open(LOCAL_REQUIREMENTS, "r") as f:
+                local_text = f.read()
+            if local_text.strip() == remote_text.strip():
+                write = False
+        if write:
+            with open(LOCAL_REQUIREMENTS, "w") as f:
+                f.write(remote_text.strip() + "\n")
+        subprocess.call([sys.executable, "-m", "pip", "install", "-r", LOCAL_REQUIREMENTS, "--upgrade"])
     except Exception as e:
-        QtWidgets.QMessageBox.warning(parent_widget, "Update Failed", str(e))
+        QtWidgets.QMessageBox.warning(parent, "Updater", "Requirement update error: " + str(e))
 
 
-def restart_program():
-    python = sys.executable
-    os.execl(python, python, *sys.argv)
+def check_for_updates_gui(parent=None):
+    local_ver = _read_local_version()
+    remote_ver = _get_remote_text("version.txt")
+    if not remote_ver:
+        return
+    remote_ver = remote_ver.strip()
+
+    if _compare_versions(local_ver, remote_ver):
+        msg = (
+            "A new version is available.\n\n"
+            "Current: " + local_ver + "\n"
+            "Latest: " + remote_ver + "\n\n"
+            "Do you want to update now?"
+        )
+        ans = QtWidgets.QMessageBox.question(parent, "Update Available", msg)
+        if ans == QtWidgets.QMessageBox.Yes:
+            remote_req = _get_remote_text("requirements.txt")
+            remote_code = _get_remote_text("ops_shell.py")
+
+            _backup_file(LOCAL_SCRIPT, "ops_shell_backup.py")
+
+            if remote_code:
+                if not _download_and_replace_text_file(LOCAL_SCRIPT, remote_code):
+                    QtWidgets.QMessageBox.warning(parent, "Updater", "Failed to update main script.")
+            if remote_req:
+                _update_requirements(remote_req, parent)
+
+            try:
+                with open(LOCAL_VERSION_FILE, "w") as f:
+                    f.write(remote_ver + "\n")
+            except Exception:
+                pass
+
+            QtWidgets.QMessageBox.information(parent, "Updater", "Update complete. The application will now restart.")
+            os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 # ------------------------------
 # Utilities
 # ------------------------------
-def stardate_like_now() -> str:
+def stardate_like_now():
     now = datetime.datetime.now()
     day = now.timetuple().tm_yday
     frac = (now.hour * 3600 + now.minute * 60 + now.second) / 86400.0
-    return f"{now.year}.{day:03d}{int(frac*10)}"
+    return str(now.year) + "." + f"{day:03d}" + str(int(frac * 10))
 
 
-def human_readable_size(size_in_bytes: int) -> str:
+def human_readable_size(size_in_bytes):
     units = ["B", "KB", "MB", "GB", "TB"]
     size = float(size_in_bytes)
     for unit in units:
@@ -162,12 +219,12 @@ def human_readable_size(size_in_bytes: int) -> str:
         size /= 1024.0
 
 
-def is_windows() -> bool:
+def is_windows():
     return os.name == "nt"
 
 
-def exe_name(name: str) -> str:
-    return f"{name}.exe" if is_windows() else name
+def exe_name(name):
+    return name + ".exe" if is_windows() else name
 
 
 def venv_paths(venv: Path):
@@ -176,7 +233,7 @@ def venv_paths(venv: Path):
     return venv / "bin" / "python", venv / "bin" / "pip"
 
 
-def safe_app_name(script: Path) -> str:
+def safe_app_name(script: Path):
     return re.sub(r"[^A-Za-z0-9_.-]", "_", script.stem)
 
 
@@ -184,7 +241,7 @@ def safe_app_name(script: Path) -> str:
 # Custom Widgets
 # ------------------------------
 class OpsButton(QtWidgets.QPushButton):
-    def __init__(self, text: str, parent=None):
+    def __init__(self, text, parent=None):
         super().__init__(text, parent)
         self._hover = False
         self._active = False
@@ -214,7 +271,7 @@ class OpsButton(QtWidgets.QPushButton):
         self.update()
         return super().mouseReleaseEvent(e)
 
-    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+    def paintEvent(self, event):
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing, True)
         rect = self.rect()
@@ -240,7 +297,7 @@ class OpsButton(QtWidgets.QPushButton):
 
 
 class OpsPanel(QtWidgets.QFrame):
-    def __init__(self, color: QtGui.QColor, title: str = "", parent=None):
+    def __init__(self, color, title="", parent=None):
         super().__init__(parent)
         self._color = QtGui.QColor(color)
         self._title = title
@@ -295,21 +352,10 @@ class Sidebar(QtWidgets.QWidget):
         layout.addWidget(self.titlePanel)
 
         self.buttons = []
-        secops = OpsButton("SEC OPS")
-        layout.addWidget(secops)
-        self.buttons.append(secops)
-
-        regex = OpsButton("Regex Search")
-        layout.addWidget(regex)
-        self.buttons.append(regex)
-
-        files = OpsButton("File Tools")
-        layout.addWidget(files)
-        self.buttons.append(files)
-
-        builder = OpsButton("Builder")
-        layout.addWidget(builder)
-        self.buttons.append(builder)
+        for label in ["SEC OPS", "Regex Search", "File Tools", "Builder", "Link Verifier"]:
+            b = OpsButton(label)
+            layout.addWidget(b)
+            self.buttons.append(b)
 
         layout.addStretch(1)
         self.footerPanel = OpsPanel(OpsTheme.SUBACCENT, title="READY")
@@ -354,14 +400,14 @@ class Header(QtWidgets.QWidget):
     @QtCore.Slot()
     def _tick(self):
         now = datetime.datetime.now().strftime("%H:%M:%S")
-        self.clockLabel.setText(f"{stardate_like_now()}   |   {now}")
+        self.clockLabel.setText(stardate_like_now() + "   |   " + now)
 
 
 class WorkArea(QtWidgets.QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFrameShape(QtWidgets.QFrame.NoFrame)
-        self.setStyleSheet(f"background: {OpsTheme.BG.name()}; border: none;")
+        self.setStyleSheet("background: " + OpsTheme.BG.name() + "; border: none;")
         v = QtWidgets.QVBoxLayout(self)
         v.setContentsMargins(12, 12, 12, 12)
         v.setSpacing(12)
@@ -384,7 +430,7 @@ class WorkArea(QtWidgets.QFrame):
         lay.addWidget(placeholder, 1)
         self.stack.addWidget(container)
 
-    def set_page(self, w: QtWidgets.QWidget, title: str, color: QtGui.QColor):
+    def set_page(self, w, title, color):
         if self.stack.indexOf(w) == -1:
             self.stack.addWidget(w)
         self.stack.setCurrentWidget(w)
@@ -401,7 +447,7 @@ class OpsWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("Unified Operations Shell")
         self.resize(1300, 900)
-        self.setStyleSheet(f"background: {OpsTheme.BG.name()}; color: {OpsTheme.FG.name()};")
+        self.setStyleSheet("background: " + OpsTheme.BG.name() + "; color: " + OpsTheme.FG.name() + ";")
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -428,6 +474,7 @@ class OpsWindow(QtWidgets.QMainWindow):
         self._regex = None
         self._filetools = None
         self._builder = None
+        self._linkver = None
 
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Q"), self, activated=self.close)
         QtGui.QShortcut(QtGui.QKeySequence("Esc"), self, activated=self.close)
@@ -435,7 +482,7 @@ class OpsWindow(QtWidgets.QMainWindow):
         for b in self.sidebar.buttons:
             b.clicked.connect(lambda checked, btn=b: self._on_nav(btn))
 
-    def _on_nav(self, btn: OpsButton):
+    def _on_nav(self, btn):
         label = btn.text()
         for b in self.sidebar.buttons:
             b.setChecked(b is btn)
@@ -459,6 +506,11 @@ class OpsWindow(QtWidgets.QMainWindow):
             if self._builder is None:
                 self._builder = BuilderPanel()
             self.work.set_page(self._builder, "BUILDER", OpsTheme.PANEL)
+
+        elif label == "Link Verifier":
+            if self._linkver is None:
+                self._linkver = LinkVerifierPanel()
+            self.work.set_page(self._linkver, "LINK VERIFIER", OpsTheme.PANEL)
 
         else:
             self.work.stack.setCurrentIndex(0)
@@ -536,9 +588,7 @@ class SecOpsPanel(QtWidgets.QWidget):
             l.setContentsMargins(6, 6, 6, 6)
             t = QtWidgets.QPlainTextEdit()
             t.setReadOnly(True)
-            t.setStyleSheet(
-                f"background: {self.text_bg}; color: {self.text_fg}; border: 1px solid #2E3B4A;"
-            )
+            t.setStyleSheet("background: " + self.text_bg + "; color: " + self.text_fg + "; border: 1px solid #2E3B4A;")
             l.addWidget(t)
             self.tabs.addTab(w, name)
             self.textAreas[name] = t
@@ -548,7 +598,7 @@ class SecOpsPanel(QtWidgets.QWidget):
         self.portBtn.clicked.connect(self.on_port_scan)
         self.exportBtn.clicked.connect(self.on_export)
 
-    def _setBusy(self, msg: str):
+    def _setBusy(self, msg):
         self.statusLbl.setText(msg)
         self.progress.show()
 
@@ -766,7 +816,7 @@ class SecOpsPanel(QtWidgets.QWidget):
                 )
             except Exception as e:
                 QtCore.QMetaObject.invokeMethod(
-                    self, "_show_error", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, f"Inspect: {e}")
+                    self, "_show_error", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, "Inspect: " + str(e))
                 )
 
         threading.Thread(target=run, daemon=True).start()
@@ -775,16 +825,16 @@ class SecOpsPanel(QtWidgets.QWidget):
     def _fill_inspect(self, target):
         data = self.current_result or {}
         self.textAreas["Overview"].setPlainText(
-            f"Target: {target}\nStatus: {data.get('status_code')}\nTitle: {data.get('title')}"
+            "Target: " + target + "\nStatus: " + str(data.get("status_code")) + "\nTitle: " + str(data.get("title"))
         )
         self.textAreas["Headers"].setPlainText(
-            "\n".join([f"{k}: {v}" for k, v in data.get("headers", {}).items()])
+            "\n".join([k + ": " + str(v) for k, v in data.get("headers", {}).items()])
         )
-        self.textAreas["HTML"].setPlainText(data.get("html", "")[:50000])
+        self.textAreas["HTML"].setPlainText((data.get("html", "") or "")[:50000])
         for key in ["Links", "Scripts", "Images", "Iframes"]:
             self.textAreas[key].setPlainText("\n".join(data.get(key.lower(), [])))
         self.textAreas["Metadata"].setPlainText(
-            "\n".join([f"{k}: {v}" for k, v in data.get("meta", {}).items()])
+            "\n".join([k + ": " + str(v) for k, v in data.get("meta", {}).items()])
         )
         self._finish()
 
@@ -819,7 +869,7 @@ class SecOpsPanel(QtWidgets.QWidget):
                 QtCore.QMetaObject.invokeMethod(self, "_fill_vuln", QtCore.Qt.QueuedConnection)
             except Exception as e:
                 QtCore.QMetaObject.invokeMethod(
-                    self, "_show_error", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, f"Vuln: {e}")
+                    self, "_show_error", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, "Vuln: " + str(e))
                 )
 
         threading.Thread(target=run, daemon=True).start()
@@ -828,10 +878,10 @@ class SecOpsPanel(QtWidgets.QWidget):
     def _fill_vuln(self):
         vuln = self.current_vuln or {}
         recs = getattr(self, "_recs_cache", [])
-        lines = ["Missing Headers:"] + [f"- {h}" for h in vuln.get("missing_headers", [])]
+        lines = ["Missing Headers:"] + ["- " + h for h in vuln.get("missing_headers", [])]
         lines.append("\nTLS Info:\n" + json.dumps(vuln.get("tls_info", {}), indent=2)[:2000])
         self.textAreas["Vulnerabilities"].setPlainText("\n".join(lines))
-        self.textAreas["Recommendations"].setPlainText("\n".join([f"- {r}" for r in recs]))
+        self.textAreas["Recommendations"].setPlainText("\n".join(["- " + r for r in recs]))
         self._finish()
 
     def on_port_scan(self):
@@ -852,7 +902,7 @@ class SecOpsPanel(QtWidgets.QWidget):
                 QtCore.QMetaObject.invokeMethod(self, "_fill_ports", QtCore.Qt.QueuedConnection)
             except Exception as e:
                 QtCore.QMetaObject.invokeMethod(
-                    self, "_show_error", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, f"Ports: {e}")
+                    self, "_show_error", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, "Ports: " + str(e))
                 )
 
         threading.Thread(target=run, daemon=True).start()
@@ -860,12 +910,12 @@ class SecOpsPanel(QtWidgets.QWidget):
     @QtCore.Slot()
     def _fill_ports(self):
         host, resolved, ports = getattr(self, "_ports_cache", ("", "", []))
-        lines = [f"Host: {host} ({resolved})"]
+        lines = ["Host: " + host + " (" + resolved + ")"]
         if not ports:
             lines.append("No open ports.")
         else:
             lines.append("Open Ports:")
-            lines += [f"- {p}" for p in ports]
+            lines += ["- " + str(p) for p in ports]
         self.textAreas["Ports"].setPlainText("\n".join(lines))
         self._finish()
 
@@ -879,9 +929,9 @@ class SecOpsPanel(QtWidgets.QWidget):
         if not path:
             return
         bundle = {"static": self.current_result, "vuln": self.current_vuln, "ports": self.current_ports}
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w") as f:
             json.dump(bundle, f, indent=2)
-        QtWidgets.QMessageBox.information(self, "Export", f"Saved to {path}")
+        QtWidgets.QMessageBox.information(self, "Export", "Saved to " + path)
 
 
 # ------------------------------
@@ -922,7 +972,6 @@ class RegexPanel(QtWidgets.QWidget):
         row2.addWidget(self.exportBtn)
         v.addLayout(row2)
 
-        # Triggers: both Enter and Search button use a queued call so text() is committed.
         self.regexEdit.returnPressed.connect(lambda: QtCore.QTimer.singleShot(0, self._run_search_safe))
         self.searchBtn.clicked.connect(lambda: QtCore.QTimer.singleShot(0, self._run_search_safe))
 
@@ -973,7 +1022,7 @@ class RegexPanel(QtWidgets.QWidget):
         try:
             pattern = re.compile(pattern_input)
         except re.error as e:
-            QtWidgets.QMessageBox.critical(self, "Regex Search", f"Invalid regular expression: {e}")
+            QtWidgets.QMessageBox.critical(self, "Regex Search", "Invalid regular expression: " + str(e))
             return
 
         self.results = []
@@ -1000,21 +1049,17 @@ class RegexPanel(QtWidgets.QWidget):
                     fname = os.path.basename(fpath)
                     added_header = False
                     try:
-                        with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
+                        with open(fpath, "r") as fh:
                             for idx, line in enumerate(fh, start=1):
                                 if pattern.search(line):
                                     if not added_header:
-                                        html_out.append(
-                                            f"<div style='margin-top:10px;color:#E8EDF5'><b>[{html.escape(fname)}]</b></div>"
-                                        )
+                                        html_out.append("<div style='margin-top:10px;color:#E8EDF5'><b>[" + fname + "]</b></div>")
                                         added_header = True
                                     hl = self._highlight_line_html(line.rstrip("\n"), pattern)
-                                    html_out.append(f"<pre style='margin:0;color:#E8EDF5'>Line {idx}: {hl}</pre>")
+                                    html_out.append("<pre style='margin:0;color:#E8EDF5'>Line " + str(idx) + ": " + hl + "</pre>")
                                     self.results.append({"filename": fname, "line": idx, "text": line.rstrip("\n")})
                     except Exception as fe:
-                        html_out.append(
-                            f"<div style='color:#F27878'>Could not read {html.escape(fname)}: {html.escape(str(fe))}</div>"
-                        )
+                        html_out.append("<div style='color:#F27878'>Could not read " + fname + ": " + str(fe) + "</div>")
 
                 html_final = "\n".join(html_out) if html_out else "<div style='color:#B8C3D1'>No matches found.</div>"
                 QtCore.QMetaObject.invokeMethod(
@@ -1027,27 +1072,34 @@ class RegexPanel(QtWidgets.QWidget):
 
         threading.Thread(target=run, daemon=True).start()
 
-    def _highlight_line_html(self, line: str, pattern: re.Pattern) -> str:
+    def _highlight_line_html(self, line, pattern):
         spans = []
         last = 0
         for m in pattern.finditer(line):
             start, end = m.span()
             if start > last:
-                spans.append(html.escape(line[last:start]))
-            match_text = html.escape(line[start:end])
+                spans.append(self._esc(line[last:start]))
+            match_text = self._esc(line[start:end])
             spans.append("<span style='background:#F5C469;color:#111;padding:0 2px'>" + match_text + "</span>")
             last = end
         if last < len(line):
-            spans.append(html.escape(line[last:]))
+            spans.append(self._esc(line[last:]))
         return "".join(spans)
 
+    def _esc(self, s):
+        return (
+            s.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;")
+        )
+
     @QtCore.Slot(str)
-    def _set_results_html(self, html_str: str):
+    def _set_results_html(self, html_str):
         self.view.setHtml(html_str)
         self._finish("Done")
 
     @QtCore.Slot(str)
-    def _show_error(self, msg: str):
+    def _show_error(self, msg):
         QtWidgets.QMessageBox.critical(self, "Regex Search", msg)
         self._finish("Error")
 
@@ -1060,26 +1112,26 @@ class RegexPanel(QtWidgets.QWidget):
             return
         try:
             if path.lower().endswith(".json"):
-                with open(path, "w", encoding="utf-8") as f:
+                with open(path, "w") as f:
                     json.dump(self.results, f, indent=2)
             else:
-                with open(path, "w", encoding="utf-8") as f:
+                with open(path, "w") as f:
                     current = None
                     for item in self.results:
                         if item["filename"] != current:
                             current = item["filename"]
-                            f.write(f"[{current}]\n")
-                        f.write(f"Line {item['line']}: {item['text']}\n")
-            QtWidgets.QMessageBox.information(self, "Export", f"Saved to {path}")
+                            f.write("[" + current + "]\n")
+                        f.write("Line " + str(item["line"]) + ": " + item["text"] + "\n")
+            QtWidgets.QMessageBox.information(self, "Export", "Saved to " + path)
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Export", str(e))
 
 
 # ------------------------------
-# File Tools Panel (Selective Copy, Find Large Files, Renumber, Convert Dates)
+# File Tools Panel
 # ------------------------------
 class ResultsDialog(QtWidgets.QDialog):
-    def __init__(self, title: str, headers: list, rows: list, parent=None):
+    def __init__(self, title, headers, rows, parent=None):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(900, 500)
@@ -1122,12 +1174,12 @@ class ResultsDialog(QtWidgets.QDialog):
         if not path:
             return
         try:
-            with open(path, "w", newline="", encoding="utf-8") as f:
+            with open(path, "w", newline="") as f:
                 w = csv.writer(f)
                 w.writerow(headers)
                 for row in rows:
                     w.writerow(row)
-            QtWidgets.QMessageBox.information(self, "Export Complete", f"Results saved to:\n{path}")
+            QtWidgets.QMessageBox.information(self, "Export Complete", "Results saved to:\n" + path)
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Export Failed", str(e))
 
@@ -1193,7 +1245,7 @@ class FileToolsPanel(QtWidgets.QWidget):
                         else:
                             copied.append((filename, "Skipped (Exists)", src_path))
                     except Exception as e:
-                        copied.append((filename, f"Error: {e}", src_path))
+                        copied.append((filename, "Error: " + str(e), src_path))
 
         self._show_results("Selective Copy Results", ["File", "Action", "Path"], copied)
 
@@ -1244,7 +1296,7 @@ class FileToolsPanel(QtWidgets.QWidget):
         ext = ext.strip()
 
         files = []
-        regex = re.compile(rf"^{re.escape(prefix)}(\d+){re.escape(ext)}$")
+        regex = re.compile(r"^" + re.escape(prefix) + r"(\d+)" + re.escape(ext) + r"$")
         for f in os.listdir(folder):
             m = regex.match(f)
             if m:
@@ -1259,12 +1311,12 @@ class FileToolsPanel(QtWidgets.QWidget):
         for num, fname in files:
             full_path = os.path.join(folder, fname)
             if num != expected:
-                new_name = f"{prefix}{str(expected).zfill(3)}{ext}"
+                new_name = prefix + str(expected).zfill(3) + ext
                 try:
                     os.rename(full_path, os.path.join(folder, new_name))
-                    results.append((fname, f"Renamed to {new_name}", full_path))
+                    results.append((fname, "Renamed to " + new_name, full_path))
                 except Exception as e:
-                    results.append((fname, f"Error: {e}", full_path))
+                    results.append((fname, "Error: " + str(e), full_path))
             else:
                 results.append((fname, "OK", full_path))
             expected += 1
@@ -1275,7 +1327,7 @@ class FileToolsPanel(QtWidgets.QWidget):
         src = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Folder to Scan")
         if not src:
             return
-        date_pattern = re.compile(r"""^(.*?)(\d{2})-(\d{2})-(\d{4})(.*?)$""")
+        date_pattern = re.compile(r"^(.*?)(\d{2})-(\d{2})-(\d{4})(.*?)$")
 
         renamed = []
         for foldername, _, filenames in os.walk(src):
@@ -1283,14 +1335,14 @@ class FileToolsPanel(QtWidgets.QWidget):
                 mo = date_pattern.search(filename)
                 if mo:
                     before, mm, dd, yyyy, after = mo.groups()
-                    euro_filename = f"{before}{dd}-{mm}-{yyyy}{after}"
+                    euro_filename = before + dd + "-" + mm + "-" + yyyy + after
                     src_path = os.path.join(foldername, filename)
                     dest_path = os.path.join(foldername, euro_filename)
                     try:
                         shutil.move(src_path, dest_path)
                         renamed.append((filename, euro_filename, src_path))
                     except Exception as e:
-                        renamed.append((filename, f"Error: {e}", src_path))
+                        renamed.append((filename, "Error: " + str(e), src_path))
 
         self._show_results("Date Conversion Results", ["Original File", "New File", "Path"], renamed)
 
@@ -1313,7 +1365,6 @@ class BuilderWorker(QtCore.QObject):
         self.icon = icon
         self.outdir = Path(outdir)
 
-    # ---- shared logic from your CLI version ----
     def _log(self, msg):
         self.log_signal.emit(msg)
 
@@ -1324,7 +1375,7 @@ class BuilderWorker(QtCore.QObject):
         stat = shutil.disk_usage(Path.cwd())
         free_mb = stat.free // (1024 * 1024)
         if free_mb < 500:
-            raise RuntimeError(f"Not enough disk space ({free_mb}MB free, need 500MB).")
+            raise RuntimeError("Not enough disk space (" + str(free_mb) + "MB free, need 500MB).")
         try:
             urllib.request.urlopen("https://pypi.org", timeout=5)
         except Exception:
@@ -1341,33 +1392,33 @@ class BuilderWorker(QtCore.QObject):
                         candidates.append(exe)
         return candidates[0] if candidates else None
 
-    def download_and_install_inno_silent(self, tmp_dir: Path) -> Path:
+    def download_and_install_inno_silent(self, tmp_dir: Path):
         url = "https://files.jrsoftware.org/is/6/innosetup-6.2.2.exe"
         installer = tmp_dir / "innosetup_installer.exe"
         self._log("[*] Downloading Inno Setup ...")
         try:
             urllib.request.urlretrieve(url, installer)
         except Exception as e:
-            raise RuntimeError(f"Failed to download Inno Setup: {e}")
+            raise RuntimeError("Failed to download Inno Setup: " + str(e))
         self._log("[*] Running Inno Setup silent install ...")
         try:
             subprocess.check_call([str(installer), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"])
         except Exception as e:
-            raise RuntimeError(f"Inno Setup silent install failed: {e}")
+            raise RuntimeError("Inno Setup silent install failed: " + str(e))
         exe = self.find_inno_iscc()
         if not exe:
             raise RuntimeError("Inno Setup installed but ISCC.exe not found.")
-        self._log(f"[*] Inno Setup available at {exe}")
+        self._log("[*] Inno Setup available at " + str(exe))
         return exe
 
-    def ensure_inno_iscc(self, out_dir: Path) -> Path:
+    def ensure_inno_iscc(self, out_dir: Path):
         exe = self.find_inno_iscc()
         if exe:
-            self._log(f"[*] Found Inno Setup: {exe}")
+            self._log("[*] Found Inno Setup: " + str(exe))
             return exe
         return self.download_and_install_inno_silent(out_dir)
 
-    def ensure_ico(self, icon_path: str, work_dir: Path):
+    def ensure_ico(self, icon_path, work_dir: Path):
         if not icon_path:
             return None
         p = Path(icon_path)
@@ -1383,97 +1434,90 @@ class BuilderWorker(QtCore.QObject):
             out = work_dir / (p.stem + ".ico")
             img = Image.open(p)
             img.save(out, format="ICO")
-            self._log(f"[*] Converted icon to {out}")
+            self._log("[*] Converted icon to " + str(out))
             return str(out)
         except Exception as e:
-            self._log(f"[!] Failed to convert icon: {e}")
+            self._log("[!] Failed to convert icon: " + str(e))
             return None
 
-    def write_inno_script(self, app_name: str, exe_path: Path, out_dir: Path, icon_path: str) -> Path:
+    def write_inno_script(self, app_name, exe_path: Path, out_dir: Path, icon_path):
         output_dir = str(out_dir).replace("\\", "\\\\")
         iss_lines = [
-            f'#define MyAppName "{app_name}"',
-            f'#define MyAppExeName "{exe_path.name}"',
+            '#define MyAppName "' + app_name + '"',
+            '#define MyAppExeName "' + exe_path.name + '"',
             "",
             "[Setup]",
-            f"AppName={{#MyAppName}}",
+            "AppName={#MyAppName}",
             "AppVersion=1.0",
-            f"DefaultDirName={{pf}}\\{app_name}",
-            f"DefaultGroupName={app_name}",
-            f'UninstallDisplayIcon={{app}}\\{{#MyAppExeName}}',
-            f'OutputDir="{output_dir}"',
-            f"OutputBaseFilename={app_name}_Installer",
+            "DefaultDirName={pf}\\" + app_name,
+            "DefaultGroupName=" + app_name,
+            "UninstallDisplayIcon={app}\\{#MyAppExeName}",
+            'OutputDir="' + output_dir + '"',
+            "OutputBaseFilename=" + app_name + "_Installer",
             "Compression=lzma",
             "SolidCompression=yes",
-            f'SetupIconFile="{icon_path}"' if icon_path else "",
+            'SetupIconFile="' + icon_path + '"' if icon_path else "",
             "",
             "[Files]",
-            f'Source: "{exe_path}"; DestDir: "{{app}}"; Flags: ignoreversion',
+            'Source: "' + str(exe_path) + '"; DestDir: "{app}"; Flags: ignoreversion',
             "",
             "[Icons]",
-            f'Name: "{{group}}\\{app_name}"; Filename: "{{app}}\\{{#MyAppExeName}}"',
-            f'Name: "{{commondesktop}}\\{app_name}"; Filename: "{{app}}\\{{#MyAppExeName}}"; Tasks: desktopicon',
+            'Name: "{group}\\' + app_name + '"; Filename: "{app}\\{#MyAppExeName}"',
+            'Name: "{commondesktop}\\' + app_name + '"; Filename: "{app}\\{#MyAppExeName}"; Tasks: desktopicon',
             "",
             "[Tasks]",
             'Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked',
             "",
             "[Run]",
-            f'Filename: "{{app}}\\{{#MyAppExeName}}"; Description: "Launch {app_name}"; Flags: nowait postinstall skipifsilent',
+            'Filename: "{app}\\{#MyAppExeName}"; Description: "Launch ' + app_name + '"; Flags: nowait postinstall skipifsilent',
         ]
-        iss_path = out_dir / f"{app_name}.iss"
+        iss_path = out_dir / (app_name + ".iss")
         iss_path.write_text("\n".join([l for l in iss_lines if l.strip()]))
         return iss_path
 
     def install_requirements(self, requirements_file: Path, pip: Path):
         if not requirements_file or not requirements_file.exists():
             raise RuntimeError("Requirements file is required and must exist.")
-        self._log(f"[*] Installing dependencies from {requirements_file} ...")
+        self._log("[*] Installing dependencies from " + str(requirements_file) + " ...")
         try:
             subprocess.check_call([str(pip), "install", "-r", str(requirements_file)])
             self._log("[*] Dependencies installed.")
         except Exception as e:
-            raise RuntimeError(f"Failed to install dependencies: {e}")
+            raise RuntimeError("Failed to install dependencies: " + str(e))
 
     @QtCore.Slot()
     def run(self):
         try:
-            # working folders
             self.outdir.mkdir(parents=True, exist_ok=True)
             work_dir = self.outdir / "work"
             if work_dir.exists():
                 shutil.rmtree(work_dir)
             work_dir.mkdir(parents=True, exist_ok=True)
 
-            # preflight
             self.preflight_checks()
 
-            # venv
             venv = work_dir / "build_env"
             self._log("[*] Creating virtual environment ...")
             subprocess.check_call([sys.executable, "-m", "venv", str(venv)])
             python, pip = venv_paths(venv)
 
-            # pyinstaller
             self._log("[*] Installing PyInstaller ...")
             subprocess.check_call([str(pip), "install", "pyinstaller"])
 
-            # requirements
             self.install_requirements(self.req, pip)
 
-            # icon
             icon_final = self.ensure_ico(self.icon, work_dir) if self.icon else None
 
-            # build exe
             dist_dir = work_dir / "dist"
             cmd = [
                 str(python), "-m", "PyInstaller",
                 "--onefile",
                 "--noconfirm",
-                f"--distpath={dist_dir}",
+                "--distpath=" + str(dist_dir),
                 str(self.script)
             ]
             if icon_final:
-                cmd.append(f"--icon={icon_final}")
+                cmd.append("--icon=" + icon_final)
 
             self._log("[*] Running PyInstaller ...")
             self._log("    " + " ".join(cmd))
@@ -1483,9 +1527,8 @@ class BuilderWorker(QtCore.QObject):
             if not exe_built.exists():
                 raise RuntimeError("PyInstaller completed but exe was not found.")
 
-            self._log(f"[+] Built exe at {exe_built}")
+            self._log("[+] Built exe at " + str(exe_built))
 
-            # inno
             iscc = self.ensure_inno_iscc(self.outdir)
             app_name = safe_app_name(self.script)
             iss = self.write_inno_script(app_name, exe_built, self.outdir, icon_final or "")
@@ -1493,22 +1536,21 @@ class BuilderWorker(QtCore.QObject):
             self._log("[*] Compiling installer with Inno Setup ...")
             subprocess.check_call([str(iscc), str(iss)], cwd=str(self.outdir))
 
-            installer_path = self.outdir / f"{app_name}_Installer.exe"
+            installer_path = self.outdir / (app_name + "_Installer.exe")
             if not installer_path.exists():
                 raise RuntimeError("Inno Setup finished but installer not found.")
 
-            self._log(f"[+] Installer created: {installer_path}")
+            self._log("[+] Installer created: " + str(installer_path))
 
-            # cleanup
             try:
                 shutil.rmtree(work_dir)
                 self._log("[*] Cleaned intermediate build files.")
             except Exception as e:
-                self._log(f"[!] Cleanup error: {e}")
+                self._log("[!] Cleanup error: " + str(e))
 
             self.done_signal.emit(True, str(installer_path))
         except Exception as e:
-            self._log(f"[!] Error: {e}")
+            self._log("[!] Error: " + str(e))
             self.done_signal.emit(False, str(e))
 
 
@@ -1566,7 +1608,6 @@ class BuilderPanel(QtWidgets.QWidget):
         self.logView.setStyleSheet("background:#1B222C; color:#E8EDF5; border:1px solid #2E3B4A;")
         v.addWidget(self.logView, 1)
 
-        # connections
         bScript.clicked.connect(self._browse_script)
         bIcon.clicked.connect(self._browse_icon)
         bOut.clicked.connect(self._browse_out)
@@ -1593,7 +1634,7 @@ class BuilderPanel(QtWidgets.QWidget):
         if p:
             self.reqEdit.setText(p)
 
-    def _append_log(self, msg: str):
+    def _append_log(self, msg):
         self.logView.append(msg)
         self.logView.moveCursor(QtGui.QTextCursor.End)
 
@@ -1613,7 +1654,6 @@ class BuilderPanel(QtWidgets.QWidget):
         self.logView.clear()
         self._append_log("[*] Starting build ...")
 
-        # thread worker
         self.worker = BuilderWorker(script, req, icon, outd)
         self.worker_thread = QtCore.QThread(self)
         self.worker.moveToThread(self.worker_thread)
@@ -1622,7 +1662,6 @@ class BuilderPanel(QtWidgets.QWidget):
         self.worker.log_signal.connect(self._append_log)
         self.worker.done_signal.connect(self._build_finished)
 
-        # ensure proper cleanup
         self.worker.done_signal.connect(self.worker_thread.quit)
         self.worker_thread.finished.connect(self.worker.deleteLater)
         self.worker_thread.finished.connect(self.worker_thread.deleteLater)
@@ -1630,11 +1669,277 @@ class BuilderPanel(QtWidgets.QWidget):
         self.worker_thread.start()
 
     @QtCore.Slot(bool, str)
-    def _build_finished(self, ok: bool, msg: str):
+    def _build_finished(self, ok, msg):
         if ok:
-            QtWidgets.QMessageBox.information(self, "Builder", f"Installer built:\n{msg}")
+            QtWidgets.QMessageBox.information(self, "Builder", "Installer built:\n" + msg)
         else:
             QtWidgets.QMessageBox.critical(self, "Builder", msg)
+
+
+# ------------------------------
+# Link Verifier Panel (with filters and colors)
+# ------------------------------
+class LinkVerifierPanel(QtWidgets.QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._stop = False
+        self.results = []  # list of dicts: {"url", "code", "category", "final_url"}
+        self._build_ui()
+
+    def _build_ui(self):
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(12)
+
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(8)
+        self.urlEdit = QtWidgets.QLineEdit()
+        self.urlEdit.setPlaceholderText("Enter starting URL (e.g., http://example.com)")
+        self.depthSpin = QtWidgets.QSpinBox()
+        self.depthSpin.setRange(0, 5)
+        self.depthSpin.setValue(0)
+        self.depthSpin.setPrefix("Depth: ")
+        self.filterCombo = QtWidgets.QComboBox()
+        self.filterCombo.addItems(["Show: All", "Show: Broken", "Show: Redirects", "Show: Good", "Show: Skipped"])
+        self.startBtn = OpsButton("Start Scan")
+        self.stopBtn = OpsButton("Stop")
+        self.stopBtn.setChecked(False)
+        self.stopBtn.setEnabled(False)
+
+        for b in (self.startBtn, self.stopBtn):
+            b.setChecked(False)
+
+        row.addWidget(self.urlEdit, 1)
+        row.addWidget(self.depthSpin)
+        row.addWidget(self.filterCombo)
+        row.addWidget(self.startBtn)
+        row.addWidget(self.stopBtn)
+        v.addLayout(row)
+
+        stat = QtWidgets.QHBoxLayout()
+        stat.setSpacing(8)
+        self.statusLbl = QtWidgets.QLabel("Ready")
+        self.statusLbl.setStyleSheet("color: #E8EDF5")
+        self.progress = QtWidgets.QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.hide()
+        stat.addWidget(self.statusLbl, 0)
+        stat.addWidget(self.progress, 1)
+        v.addLayout(stat)
+
+        self.view = QtWidgets.QTextEdit()
+        self.view.setReadOnly(True)
+        self.view.setStyleSheet("background:#1B222C; color:#E8EDF5; border:1px solid #2E3B4A;")
+        v.addWidget(self.view, 1)
+
+        self.startBtn.clicked.connect(self._start_scan)
+        self.stopBtn.clicked.connect(self._stop_scan)
+        self.filterCombo.currentIndexChanged.connect(self._refresh_view)
+
+    def _start_scan(self):
+        start_url = self.urlEdit.text().strip()
+        if not start_url:
+            QtWidgets.QMessageBox.critical(self, "Link Verifier", "Please enter a URL.")
+            return
+        if not start_url.startswith("http"):
+            start_url = "http://" + start_url
+            self.urlEdit.setText(start_url)
+
+        depth = int(self.depthSpin.value())
+        self.view.clear()
+        self.results = []
+        self._stop = False
+        self.stopBtn.setEnabled(True)
+        self._setBusy("Scanning...")
+
+        def run():
+            try:
+                report_lines = []
+                visited = set()
+                self._add_log_line("Starting at: " + start_url)
+                self._crawl(start_url, depth, visited)
+                self._add_log_line("")
+                self._add_log_line("Scan complete. Writing report.txt ...")
+                self._write_report()
+            except Exception as e:
+                self._add_log_line("Error: " + str(e))
+            finally:
+                QtCore.QMetaObject.invokeMethod(self, "_finish", QtCore.Qt.QueuedConnection)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _stop_scan(self):
+        self._stop = True
+        self._add_log_line("Stop requested...")
+
+    def _setBusy(self, msg):
+        self.statusLbl.setText(msg)
+        self.progress.show()
+
+    @QtCore.Slot()
+    def _finish(self):
+        self.progress.hide()
+        self.statusLbl.setText("Done")
+        self.stopBtn.setEnabled(False)
+        self._refresh_view()
+
+    def _add_log_line(self, text):
+        QtCore.QMetaObject.invokeMethod(self.view, "append", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, text))
+
+    def _fetch_links(self, url):
+        try:
+            r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code >= 400:
+                return [], r.status_code
+            soup = BeautifulSoup(r.text, "html.parser")
+            links = []
+            for a in soup.find_all("a", href=True):
+                links.append(urljoin(url, a["href"]))
+            return links, r.status_code
+        except Exception:
+            return [], None
+
+    def _check_link(self, url):
+        try:
+            r = requests.head(url, allow_redirects=True, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+            code = r.status_code
+            final_url = r.url
+            redirected = len(r.history) > 0
+            if code >= 400 or code == 0:
+                r = requests.get(url, stream=True, allow_redirects=True, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+                code = r.status_code
+                final_url = r.url
+                redirected = len(r.history) > 0
+            return code, final_url, redirected
+        except Exception:
+            return None, None, False
+
+    def _add_result(self, url, code, final_url, redirected):
+        if code is None:
+            category = "broken"
+        elif code >= 400:
+            category = "broken"
+        elif 300 <= code <= 399 or redirected:
+            category = "redirect"
+        elif 200 <= code <= 299:
+            category = "good"
+        else:
+            category = "skipped"
+
+        entry = {"url": url, "code": code, "category": category, "final_url": final_url or ""}
+        self.results.append(entry)
+
+        # incremental append for current filter
+        if self._should_show(entry):
+            QtCore.QMetaObject.invokeMethod(
+                self.view, "append", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, self._format_entry(entry))
+            )
+
+    def _should_show(self, entry):
+        idx = self.filterCombo.currentIndex()
+        if idx == 0:
+            return True
+        if idx == 1:
+            return entry["category"] == "broken"
+        if idx == 2:
+            return entry["category"] == "redirect"
+        if idx == 3:
+            return entry["category"] == "good"
+        if idx == 4:
+            return entry["category"] == "skipped"
+        return True
+
+    def _format_entry(self, e):
+        # color-coded HTML lines; ASCII only
+        cat = e["category"]
+        code = "None" if e["code"] is None else str(e["code"])
+        url = e["url"]
+        final_url = e["final_url"]
+        if cat == "broken":
+            color = "#F27878"
+        elif cat == "redirect":
+            color = "#E8B45D"
+        elif cat == "good":
+            color = "#7FD3A2"
+        else:
+            color = "#B8C3D1"
+        if cat == "redirect" and final_url and final_url != url:
+            tail = " -> " + final_url
+        else:
+            tail = ""
+        return "<span style='color:" + color + "'>" + code + "</span> " + url + tail
+
+    def _refresh_view(self):
+        # rebuild display from self.results using current filter
+        lines = []
+        for e in self.results:
+            if self._should_show(e):
+                lines.append(self._format_entry(e))
+        html = "\n".join(lines) if lines else "<span style='color:#B8C3D1'>No results for this filter.</span>"
+        self.view.setHtml(html)
+
+    def _crawl(self, start_url, max_depth, visited):
+        origin = urlparse(start_url)
+        base_host = origin.netloc.lower()
+
+        def crawl_one(url, depth):
+            if self._stop:
+                return
+            if url in visited:
+                self._add_log_line("SKIP " + url)
+                self.results.append({"url": url, "code": None, "category": "skipped", "final_url": ""})
+                return
+            visited.add(url)
+            code, final_url, redirected = self._check_link(url)
+            self._add_result(url, code, final_url, redirected)
+
+            if depth >= max_depth:
+                return
+
+            links, _status = self._fetch_links(url)
+            for link in links:
+                if self._stop:
+                    return
+                pr = urlparse(link)
+                if pr.scheme in ("http", "https") and pr.netloc.lower() == base_host:
+                    crawl_one(link, depth + 1)
+
+        crawl_one(start_url, 0)
+
+    def _write_report(self):
+        # Group in the required order: Broken, Redirects, Good, Skipped
+        broken = [e for e in self.results if e["category"] == "broken"]
+        redirects = [e for e in self.results if e["category"] == "redirect"]
+        good = [e for e in self.results if e["category"] == "good"]
+        skipped = [e for e in self.results if e["category"] == "skipped"]
+
+        try:
+            with open("report.txt", "w") as f:
+                f.write("[BROKEN LINKS]\n")
+                for e in broken:
+                    code = "None" if e["code"] is None else str(e["code"])
+                    f.write(code + " " + e["url"] + "\n")
+
+                f.write("\n[REDIRECTED LINKS]\n")
+                for e in redirects:
+                    code = "None" if e["code"] is None else str(e["code"])
+                    if e["final_url"] and e["final_url"] != e["url"]:
+                        f.write(code + " " + e["url"] + " -> " + e["final_url"] + "\n")
+                    else:
+                        f.write(code + " " + e["url"] + "\n")
+
+                f.write("\n[GOOD LINKS]\n")
+                for e in good:
+                    code = "None" if e["code"] is None else str(e["code"])
+                    f.write(code + " " + e["url"] + "\n")
+
+                f.write("\n[SKIPPED]\n")
+                for e in skipped:
+                    f.write("SKIP " + e["url"] + "\n")
+
+            self._add_log_line("Saved report.txt")
+        except Exception as fe:
+            self._add_log_line("Could not write report.txt: " + str(fe))
 
 
 # ------------------------------
@@ -1643,7 +1948,10 @@ class BuilderPanel(QtWidgets.QWidget):
 def main():
     app = QtWidgets.QApplication(sys.argv)
     app.setFont(QtGui.QFont("Arial", 10))
-    check_for_updates(None)
+
+    # Prompted auto-update with backup
+    check_for_updates_gui(None)
+
     w = OpsWindow()
     w.show()
     sys.exit(app.exec())
