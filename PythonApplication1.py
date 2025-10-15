@@ -1128,7 +1128,7 @@ class RegexPanel(QtWidgets.QWidget):
 
 
 # ------------------------------
-# File Tools Panel
+# File Tools Panel (existing tools; Image Downloader will be added in Part 2)
 # ------------------------------
 class ResultsDialog(QtWidgets.QDialog):
     def __init__(self, title, headers, rows, parent=None):
@@ -1203,6 +1203,7 @@ class FileToolsPanel(QtWidgets.QWidget):
         self.btnLarge = OpsButton("Find Large Files")
         self.btnRenumber = OpsButton("Renumber Files")
         self.btnConvert = OpsButton("Convert Dates")
+        # Part 2 will add: self.btnImgDL = OpsButton("Image Downloader")
 
         for b in (self.btnCopy, self.btnLarge, self.btnRenumber, self.btnConvert):
             b.setChecked(False)
@@ -1211,6 +1212,7 @@ class FileToolsPanel(QtWidgets.QWidget):
         grid.addWidget(self.btnLarge, 0, 1)
         grid.addWidget(self.btnRenumber, 1, 0)
         grid.addWidget(self.btnConvert, 1, 1)
+        # Part 2 will add a new row for Image Downloader
 
         v.addLayout(grid)
         v.addStretch(1)
@@ -1219,6 +1221,7 @@ class FileToolsPanel(QtWidgets.QWidget):
         self.btnLarge.clicked.connect(self.find_large_files)
         self.btnRenumber.clicked.connect(self.renumber_files)
         self.btnConvert.clicked.connect(self.convert_dates)
+        # Part 2 will connect: self.btnImgDL.clicked.connect(self.open_image_downloader)
 
     def selective_copy(self):
         src = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Source Folder")
@@ -1349,611 +1352,474 @@ class FileToolsPanel(QtWidgets.QWidget):
     def _show_results(self, title, headers, rows):
         dlg = ResultsDialog(title, headers, rows, self)
         dlg.exec()
+# ------------------------------------------------------------
+# Image Downloader Subtool (inside FileToolsPanel)
+# ------------------------------------------------------------
 
+class ImageDownloaderWidget(QtWidgets.QWidget):
+    """Embedded image downloader with threaded downloads, fallback crawler, and log output."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._build_ui()
 
-# ------------------------------
-# Builder Panel (OneTouchBuilder)
-# ------------------------------
-class BuilderWorker(QtCore.QObject):
-    log_signal = QtCore.Signal(str)
-    done_signal = QtCore.Signal(bool, str)
+    def _build_ui(self):
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(12, 12, 12, 12)
+        v.setSpacing(8)
 
-    def __init__(self, script, req, icon, outdir):
-        super().__init__()
-        self.script = Path(script)
-        self.req = Path(req)
-        self.icon = icon
-        self.outdir = Path(outdir)
+        form = QtWidgets.QGridLayout()
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(6)
 
-    def _log(self, msg):
-        self.log_signal.emit(msg)
+        self.urlEdit = QtWidgets.QLineEdit()
+        self.urlEdit.setPlaceholderText(
+            "Enter Imgur album URL, direct image URL, or site (e.g. https://www.nic.edu)"
+        )
 
-    def preflight_checks(self):
-        min_python = (3, 9)
-        if sys.version_info < min_python:
-            raise RuntimeError("Python 3.9+ required.")
-        stat = shutil.disk_usage(Path.cwd())
-        free_mb = stat.free // (1024 * 1024)
-        if free_mb < 500:
-            raise RuntimeError("Not enough disk space (" + str(free_mb) + "MB free, need 500MB).")
-        try:
-            urllib.request.urlopen("https://pypi.org", timeout=5)
-        except Exception:
-            raise RuntimeError("Internet connection required.")
-        self._log("[*] Preflight checks passed.")
+        self.folderBtn = OpsButton("Select Output Folder")
+        self.folderEdit = QtWidgets.QLineEdit()
+        self.folderEdit.setReadOnly(True)
 
-    def find_inno_iscc(self):
-        candidates = []
-        for base in [Path("C:/Program Files (x86)"), Path("C:/Program Files")]:
-            if base.exists():
-                for sub in base.glob("Inno Setup*"):
-                    exe = sub / "ISCC.exe"
-                    if exe.exists():
-                        candidates.append(exe)
-        return candidates[0] if candidates else None
+        self.threadLabel = QtWidgets.QLabel("Threads:")
+        self.threadSpin = QtWidgets.QSpinBox()
+        self.threadSpin.setRange(1, 50)
+        self.threadSpin.setValue(10)
 
-    def download_and_install_inno_silent(self, tmp_dir: Path):
-        url = "https://files.jrsoftware.org/is/6/innosetup-6.2.2.exe"
-        installer = tmp_dir / "innosetup_installer.exe"
-        self._log("[*] Downloading Inno Setup ...")
-        try:
-            urllib.request.urlretrieve(url, installer)
-        except Exception as e:
-            raise RuntimeError("Failed to download Inno Setup: " + str(e))
-        self._log("[*] Running Inno Setup silent install ...")
-        try:
-            subprocess.check_call([str(installer), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"])
-        except Exception as e:
-            raise RuntimeError("Inno Setup silent install failed: " + str(e))
-        exe = self.find_inno_iscc()
-        if not exe:
-            raise RuntimeError("Inno Setup installed but ISCC.exe not found.")
-        self._log("[*] Inno Setup available at " + str(exe))
-        return exe
+        self.depthLabel = QtWidgets.QLabel("Max pages to scan:")
+        self.depthSpin = QtWidgets.QSpinBox()
+        self.depthSpin.setRange(1, 10)
+        self.depthSpin.setValue(3)
 
-    def ensure_inno_iscc(self, out_dir: Path):
-        exe = self.find_inno_iscc()
-        if exe:
-            self._log("[*] Found Inno Setup: " + str(exe))
-            return exe
-        return self.download_and_install_inno_silent(out_dir)
+        self.startBtn = OpsButton("Start Download")
 
-    def ensure_ico(self, icon_path, work_dir: Path):
-        if not icon_path:
-            return None
-        p = Path(icon_path)
-        if not p.exists():
-            self._log("[!] Icon file not found, skipping icon.")
-            return None
-        if p.suffix.lower() == ".ico":
-            return str(p)
-        if Image is None:
-            self._log("[!] Pillow not installed, cannot convert image to .ico. Continue without icon.")
-            return None
-        try:
-            out = work_dir / (p.stem + ".ico")
-            img = Image.open(p)
-            img.save(out, format="ICO")
-            self._log("[*] Converted icon to " + str(out))
-            return str(out)
-        except Exception as e:
-            self._log("[!] Failed to convert icon: " + str(e))
-            return None
+        form.addWidget(QtWidgets.QLabel("Source:"), 0, 0)
+        form.addWidget(self.urlEdit, 0, 1, 1, 4)
+        form.addWidget(QtWidgets.QLabel("Output:"), 1, 0)
+        form.addWidget(self.folderEdit, 1, 1, 1, 3)
+        form.addWidget(self.folderBtn, 1, 4)
+        form.addWidget(self.threadLabel, 2, 0)
+        form.addWidget(self.threadSpin, 2, 1)
+        form.addWidget(self.depthLabel, 2, 2)
+        form.addWidget(self.depthSpin, 2, 3)
+        form.addWidget(self.startBtn, 2, 4)
+        v.addLayout(form)
 
-    def write_inno_script(self, app_name, exe_path: Path, out_dir: Path, icon_path):
-        output_dir = str(out_dir).replace("\\", "\\\\")
-        iss_lines = [
-            '#define MyAppName "' + app_name + '"',
-            '#define MyAppExeName "' + exe_path.name + '"',
-            "",
-            "[Setup]",
-            "AppName={#MyAppName}",
-            "AppVersion=1.0",
-            "DefaultDirName={pf}\\" + app_name,
-            "DefaultGroupName=" + app_name,
-            "UninstallDisplayIcon={app}\\{#MyAppExeName}",
-            'OutputDir="' + output_dir + '"',
-            "OutputBaseFilename=" + app_name + "_Installer",
-            "Compression=lzma",
-            "SolidCompression=yes",
-            'SetupIconFile="' + icon_path + '"' if icon_path else "",
-            "",
-            "[Files]",
-            'Source: "' + str(exe_path) + '"; DestDir: "{app}"; Flags: ignoreversion',
-            "",
-            "[Icons]",
-            'Name: "{group}\\' + app_name + '"; Filename: "{app}\\{#MyAppExeName}"',
-            'Name: "{commondesktop}\\' + app_name + '"; Filename: "{app}\\{#MyAppExeName}"; Tasks: desktopicon',
-            "",
-            "[Tasks]",
-            'Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked',
-            "",
-            "[Run]",
-            'Filename: "{app}\\{#MyAppExeName}"; Description: "Launch ' + app_name + '"; Flags: nowait postinstall skipifsilent',
-        ]
-        iss_path = out_dir / (app_name + ".iss")
-        iss_path.write_text("\n".join([l for l in iss_lines if l.strip()]))
-        return iss_path
+        self.log = QtWidgets.QTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setStyleSheet(
+            "background:#1B222C;color:#E8EDF5;border:1px solid #2E3B4A;"
+        )
+        v.addWidget(self.log, 1)
 
-    def install_requirements(self, requirements_file: Path, pip: Path):
-        if not requirements_file or not requirements_file.exists():
-            raise RuntimeError("Requirements file is required and must exist.")
-        self._log("[*] Installing dependencies from " + str(requirements_file) + " ...")
-        try:
-            subprocess.check_call([str(pip), "install", "-r", str(requirements_file)])
-            self._log("[*] Dependencies installed.")
-        except Exception as e:
-            raise RuntimeError("Failed to install dependencies: " + str(e))
+        self.folderBtn.clicked.connect(self._pick_folder)
+        self.startBtn.clicked.connect(self._start_downloads)
 
-    @QtCore.Slot()
-    def run(self):
-        try:
-            self.outdir.mkdir(parents=True, exist_ok=True)
-            work_dir = self.outdir / "work"
-            if work_dir.exists():
-                shutil.rmtree(work_dir)
-            work_dir.mkdir(parents=True, exist_ok=True)
+    def _pick_folder(self):
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Output Folder", "")
+        if path:
+            self.folderEdit.setText(path)
 
-            self.preflight_checks()
+    def _append_log(self, msg, color="#E8EDF5"):
+        self.log.append("<span style='color:%s'>%s</span>" % (color, msg))
 
-            venv = work_dir / "build_env"
-            self._log("[*] Creating virtual environment ...")
-            subprocess.check_call([sys.executable, "-m", "venv", str(venv)])
-            python, pip = venv_paths(venv)
+    def _start_downloads(self):
+        src = self.urlEdit.text().strip()
+        dest = self.folderEdit.text().strip()
+        threads = self.threadSpin.value()
+        depth = self.depthSpin.value()
 
-            self._log("[*] Installing PyInstaller ...")
-            subprocess.check_call([str(pip), "install", "pyinstaller"])
+        if not src:
+            QtWidgets.QMessageBox.warning(self, "Image Downloader", "Please enter a URL or file path.")
+            return
+        if not dest:
+            now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            dest = os.path.join(os.getcwd(), "downloads_" + now)
+            os.makedirs(dest, exist_ok=True)
+            self.folderEdit.setText(dest)
 
-            self.install_requirements(self.req, pip)
+        self.log.clear()
+        self._append_log(
+            f"Starting downloads with {threads} threads (max {depth} pages to scan)...",
+            color="#7FD3A2",
+        )
 
-            icon_final = self.ensure_ico(self.icon, work_dir) if self.icon else None
+        t = threading.Thread(target=self._run_downloads, args=(src, dest, threads, depth), daemon=True)
+        t.start()
 
-            dist_dir = work_dir / "dist"
-            cmd = [
-                str(python), "-m", "PyInstaller",
-                "--onefile",
-                "--noconfirm",
-                "--distpath=" + str(dist_dir),
-                str(self.script)
-            ]
-            if icon_final:
-                cmd.append("--icon=" + icon_final)
+    # ------------------------------------------------------------------
+    # Core worker
+    # ------------------------------------------------------------------
+    def _run_downloads(self, src, dest, threads, depth):
+        urls = []
 
-            self._log("[*] Running PyInstaller ...")
-            self._log("    " + " ".join(cmd))
-            subprocess.check_call(cmd)
-
-            exe_built = dist_dir / exe_name(self.script.stem)
-            if not exe_built.exists():
-                raise RuntimeError("PyInstaller completed but exe was not found.")
-
-            self._log("[+] Built exe at " + str(exe_built))
-
-            iscc = self.ensure_inno_iscc(self.outdir)
-            app_name = safe_app_name(self.script)
-            iss = self.write_inno_script(app_name, exe_built, self.outdir, icon_final or "")
-
-            self._log("[*] Compiling installer with Inno Setup ...")
-            subprocess.check_call([str(iscc), str(iss)], cwd=str(self.outdir))
-
-            installer_path = self.outdir / (app_name + "_Installer.exe")
-            if not installer_path.exists():
-                raise RuntimeError("Inno Setup finished but installer not found.")
-
-            self._log("[+] Installer created: " + str(installer_path))
-
+        # If user provided a file of URLs
+        if os.path.isfile(src):
             try:
-                shutil.rmtree(work_dir)
-                self._log("[*] Cleaned intermediate build files.")
+                with open(src, "r") as f:
+                    urls = [line.strip() for line in f if line.strip()]
             except Exception as e:
-                self._log("[!] Cleanup error: " + str(e))
+                self._append_log("Error reading file list: " + str(e), "#F27878")
+                return
+        else:
+            urls.append(src)
 
-            self.done_signal.emit(True, str(installer_path))
-        except Exception as e:
-            self._log("[!] Error: " + str(e))
-            self.done_signal.emit(False, str(e))
+        # Handle Imgur album
+        if any("imgur.com/a/" in u or "imgur.com/gallery/" in u for u in urls):
+            urls = self._extract_imgur_images(urls)
 
+        # Crawl fallback for general websites
+        if len(urls) == 1 and not any(x in urls[0] for x in ("imgur.com", ".jpg", ".png", ".gif", ".webp")):
+            self._append_log("No direct image links detected, starting crawler...", "#D89E3F")
+            urls = self._crawl_site(urls[0], depth)
+
+        # Filter and download
+        valid_ext = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+        urls = [u for u in urls if any(x in u.lower() for x in valid_ext)]
+        if not urls:
+            self._append_log("No valid image URLs found.", "#F27878")
+            return
+
+        self._append_log(f"Found {len(urls)} image URLs. Beginning downloads...")
+
+        report_path = os.path.join(dest, "report.txt")
+        report = []
+        lock = threading.Lock()
+        q = {"i": 0}
+        total = len(urls)
+
+        def worker():
+            while True:
+                with lock:
+                    if q["i"] >= total:
+                        return
+                    i = q["i"]
+                    q["i"] += 1
+                url = urls[i]
+                name = os.path.basename(urlparse(url).path)
+                out_path = os.path.join(dest, name)
+                try:
+                    if os.path.exists(out_path):
+                        with lock:
+                            self._append_log("[Skip] " + name, "#D89E3F")
+                            report.append((name, "Skipped"))
+                        continue
+                    r = requests.get(url, stream=True, timeout=15)
+                    if r.status_code == 200:
+                        with open(out_path, "wb") as f:
+                            for chunk in r.iter_content(8192):
+                                f.write(chunk)
+                        with lock:
+                            self._append_log("[OK] " + name, "#7FD3A2")
+                            report.append((name, "OK"))
+                    else:
+                        with lock:
+                            self._append_log("[Fail] " + name + f" ({r.status_code})", "#F27878")
+                            report.append((name, "HTTP " + str(r.status_code)))
+                except Exception as e:
+                    with lock:
+                        self._append_log("[Err] " + name + " " + str(e), "#F27878")
+                        report.append((name, "Error: " + str(e)))
+
+        threads_list = []
+        for _ in range(min(threads, len(urls))):
+            t = threading.Thread(target=worker, daemon=True)
+            t.start()
+            threads_list.append(t)
+        for t in threads_list:
+            t.join()
+
+        with open(report_path, "w") as f:
+            for name, status in report:
+                f.write(f"{name}\t{status}\n")
+
+        self._append_log(f"Report written to {report_path}", "#7FD3A2")
+
+        try:
+            if is_windows():
+                os.startfile(dest)
+            elif sys.platform == "darwin":
+                subprocess.call(["open", dest])
+            else:
+                subprocess.call(["xdg-open", dest])
+        except Exception:
+            pass
+
+        self._append_log("Download complete.", "#7FD3A2")
+
+    # ------------------------------------------------------------------
+    # Support functions
+    # ------------------------------------------------------------------
+    def _extract_imgur_images(self, urls):
+        all_imgs = []
+        for u in urls:
+            try:
+                r = requests.get(u, timeout=10)
+                soup = BeautifulSoup(r.text, "html.parser")
+                imgs = soup.find_all("img")
+                for img in imgs:
+                    src = img.get("src")
+                    if src:
+                        if src.startswith("//"):
+                            src = "https:" + src
+                        elif src.startswith("/"):
+                            src = "https://imgur.com" + src
+                        if any(ext in src.lower() for ext in (".jpg", ".png", ".gif", ".webp")):
+                            all_imgs.append(src)
+            except Exception as e:
+                self._append_log("Imgur parse error: " + str(e), "#F27878")
+        return list(dict.fromkeys(all_imgs))
+
+    def _crawl_site(self, base_url, depth):
+        """Crawl within the same domain up to 'depth' pages and collect image URLs."""
+        seen = set()
+        found_imgs = []
+        domain = urlparse(base_url).netloc
+        queue = [base_url]
+
+        for _ in range(depth):
+            new_queue = []
+            for url in queue:
+                if url in seen:
+                    continue
+                seen.add(url)
+                self._append_log("[Scan] " + url, "#D89E3F")
+                try:
+                    r = requests.get(url, timeout=10)
+                    soup = BeautifulSoup(r.text, "html.parser")
+                    imgs = [urljoin(url, img.get("src")) for img in soup.find_all("img", src=True)]
+                    found_imgs.extend(imgs)
+                    links = [urljoin(url, a.get("href")) for a in soup.find_all("a", href=True)]
+                    for l in links:
+                        if urlparse(l).netloc == domain and l not in seen and any(
+                            not l.endswith(ext) for ext in (".jpg", ".png", ".gif", ".webp")
+                        ):
+                            new_queue.append(l)
+                except Exception as e:
+                    self._append_log("Crawl error: " + str(e), "#F27878")
+            queue = new_queue
+
+        return list(dict.fromkeys(found_imgs))
+
+# ------------------------------------------------------------
+# Integrate Image Downloader into FileToolsPanel
+# ------------------------------------------------------------
+
+def add_image_downloader_to_filetools():
+    def open_image_downloader(self):
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Image Downloader")
+        dlg.resize(700, 500)
+        v = QtWidgets.QVBoxLayout(dlg)
+        widget = ImageDownloaderWidget(dlg)
+        v.addWidget(widget)
+        dlg.exec()
+
+    FileToolsPanel.open_image_downloader = open_image_downloader
+    old_build_ui = FileToolsPanel._build_ui
+
+    def new_build_ui(self):
+        old_build_ui(self)
+        # Add button to layout
+        grid = self.layout().itemAt(0)
+        if isinstance(grid, QtWidgets.QGridLayout):
+            self.btnImgDL = OpsButton("Image Downloader")
+            grid.addWidget(self.btnImgDL, 2, 0)
+            self.btnImgDL.clicked.connect(self.open_image_downloader)
+
+    FileToolsPanel._build_ui = new_build_ui
+
+add_image_downloader_to_filetools()
+
+
+# ------------------------------------------------------------
+# Builder Panel
+# ------------------------------------------------------------
 
 class BuilderPanel(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._build_ui()
-        self.worker_thread = None
-        self.worker = None
-
-    def _build_ui(self):
         v = QtWidgets.QVBoxLayout(self)
-        v.setContentsMargins(0, 0, 0, 0)
+        v.setContentsMargins(12, 12, 12, 12)
         v.setSpacing(8)
 
+        self.info = QtWidgets.QLabel(
+            "OneTouch Builder converts your Python app into a Windows EXE using PyInstaller.\n"
+            "Select script, optional icon, and output folder."
+        )
+        self.info.setStyleSheet("color:#E8EDF5;")
+        v.addWidget(self.info)
+
         form = QtWidgets.QGridLayout()
-        form.setContentsMargins(12, 12, 12, 0)
-        form.setHorizontalSpacing(8)
-        form.setVerticalSpacing(8)
+        form.setSpacing(8)
 
         self.scriptEdit = QtWidgets.QLineEdit()
         self.iconEdit = QtWidgets.QLineEdit()
-        self.outEdit = QtWidgets.QLineEdit(str(Path.cwd() / "build_output"))
-        self.reqEdit = QtWidgets.QLineEdit()
+        self.outEdit = QtWidgets.QLineEdit()
 
-        bScript = QtWidgets.QPushButton("Browse")
-        bIcon = QtWidgets.QPushButton("Browse")
-        bOut = QtWidgets.QPushButton("Browse")
-        bReq = QtWidgets.QPushButton("Browse")
+        self.pickScript = OpsButton("Script")
+        self.pickIcon = OpsButton("Icon")
+        self.pickOut = OpsButton("Output")
+        self.buildBtn = OpsButton("Build")
 
         form.addWidget(QtWidgets.QLabel("Script:"), 0, 0)
         form.addWidget(self.scriptEdit, 0, 1)
-        form.addWidget(bScript, 0, 2)
-
+        form.addWidget(self.pickScript, 0, 2)
         form.addWidget(QtWidgets.QLabel("Icon:"), 1, 0)
         form.addWidget(self.iconEdit, 1, 1)
-        form.addWidget(bIcon, 1, 2)
-
-        form.addWidget(QtWidgets.QLabel("Output Dir:"), 2, 0)
+        form.addWidget(self.pickIcon, 1, 2)
+        form.addWidget(QtWidgets.QLabel("Output:"), 2, 0)
         form.addWidget(self.outEdit, 2, 1)
-        form.addWidget(bOut, 2, 2)
-
-        form.addWidget(QtWidgets.QLabel("Requirements:"), 3, 0)
-        form.addWidget(self.reqEdit, 3, 1)
-        form.addWidget(bReq, 3, 2)
-
+        form.addWidget(self.pickOut, 2, 2)
         v.addLayout(form)
 
-        self.buildBtn = OpsButton("Build Installer")
-        self.buildBtn.setChecked(False)
-        v.addWidget(self.buildBtn, 0, QtCore.Qt.AlignLeft)
+        v.addWidget(self.buildBtn)
+        v.addStretch(1)
 
-        self.logView = QtWidgets.QTextEdit()
-        self.logView.setReadOnly(True)
-        self.logView.setStyleSheet("background:#1B222C; color:#E8EDF5; border:1px solid #2E3B4A;")
-        v.addWidget(self.logView, 1)
+        self.pickScript.clicked.connect(self._pick_script)
+        self.pickIcon.clicked.connect(self._pick_icon)
+        self.pickOut.clicked.connect(self._pick_out)
+        self.buildBtn.clicked.connect(self._build_exe)
 
-        bScript.clicked.connect(self._browse_script)
-        bIcon.clicked.connect(self._browse_icon)
-        bOut.clicked.connect(self._browse_out)
-        bReq.clicked.connect(self._browse_req)
-        self.buildBtn.clicked.connect(self._start_build)
+    def _pick_script(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select Script", "", "Python Files (*.py)")
+        if path:
+            self.scriptEdit.setText(path)
 
-    def _browse_script(self):
-        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select Python Script", "", "Python (*.py)")
-        if p:
-            self.scriptEdit.setText(p)
+    def _pick_icon(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select Icon", "", "ICO Files (*.ico)")
+        if path:
+            self.iconEdit.setText(path)
 
-    def _browse_icon(self):
-        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select Icon", "", "Images (*.ico *.png *.jpg *.jpeg)")
-        if p:
-            self.iconEdit.setText(p)
+    def _pick_out(self):
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Output Folder", "")
+        if path:
+            self.outEdit.setText(path)
 
-    def _browse_out(self):
-        p = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Output Directory", "")
-        if p:
-            self.outEdit.setText(p)
-
-    def _browse_req(self):
-        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select requirements.txt", "", "Text (*.txt)")
-        if p:
-            self.reqEdit.setText(p)
-
-    def _append_log(self, msg):
-        self.logView.append(msg)
-        self.logView.moveCursor(QtGui.QTextCursor.End)
-
-    def _start_build(self):
+    def _build_exe(self):
         script = self.scriptEdit.text().strip()
-        req = self.reqEdit.text().strip()
+        outdir = self.outEdit.text().strip() or os.getcwd()
         icon = self.iconEdit.text().strip()
-        outd = self.outEdit.text().strip()
-
         if not script:
-            QtWidgets.QMessageBox.critical(self, "Builder", "Please select a Python script.")
-            return
-        if not req:
-            QtWidgets.QMessageBox.critical(self, "Builder", "Please select a requirements.txt file.")
+            QtWidgets.QMessageBox.warning(self, "Builder", "Select a Python script first.")
             return
 
-        self.logView.clear()
-        self._append_log("[*] Starting build ...")
+        exe = exe_name(safe_app_name(Path(script)))
+        cmd = [sys.executable, "-m", "PyInstaller", "--onefile", "-n", exe, "--distpath", outdir]
+        if icon:
+            cmd += ["--icon", icon]
+        cmd += [script]
 
-        self.worker = BuilderWorker(script, req, icon, outd)
-        self.worker_thread = QtCore.QThread(self)
-        self.worker.moveToThread(self.worker_thread)
-
-        self.worker_thread.started.connect(self.worker.run)
-        self.worker.log_signal.connect(self._append_log)
-        self.worker.done_signal.connect(self._build_finished)
-
-        self.worker.done_signal.connect(self.worker_thread.quit)
-        self.worker_thread.finished.connect(self.worker.deleteLater)
-        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
-
-        self.worker_thread.start()
-
-    @QtCore.Slot(bool, str)
-    def _build_finished(self, ok, msg):
-        if ok:
-            QtWidgets.QMessageBox.information(self, "Builder", "Installer built:\n" + msg)
-        else:
-            QtWidgets.QMessageBox.critical(self, "Builder", msg)
+        dlg = QtWidgets.QMessageBox(self)
+        dlg.setWindowTitle("Builder")
+        dlg.setText("Building executable... this may take a while.\n\nCommand:\n" + " ".join(cmd))
+        dlg.show()
+        threading.Thread(target=lambda: subprocess.call(cmd), daemon=True).start()
 
 
-# ------------------------------
-# Link Verifier Panel (with filters and colors)
-# ------------------------------
+# ------------------------------------------------------------
+# Link Verifier Panel
+# ------------------------------------------------------------
+
 class LinkVerifierPanel(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._stop = False
-        self.results = []  # list of dicts: {"url", "code", "category", "final_url"}
-        self._build_ui()
-
-    def _build_ui(self):
         v = QtWidgets.QVBoxLayout(self)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(12)
+        v.setContentsMargins(12, 12, 12, 12)
+        v.setSpacing(8)
 
         row = QtWidgets.QHBoxLayout()
         row.setSpacing(8)
         self.urlEdit = QtWidgets.QLineEdit()
-        self.urlEdit.setPlaceholderText("Enter starting URL (e.g., http://example.com)")
-        self.depthSpin = QtWidgets.QSpinBox()
-        self.depthSpin.setRange(0, 5)
-        self.depthSpin.setValue(0)
-        self.depthSpin.setPrefix("Depth: ")
-        self.filterCombo = QtWidgets.QComboBox()
-        self.filterCombo.addItems(["Show: All", "Show: Broken", "Show: Redirects", "Show: Good", "Show: Skipped"])
-        self.startBtn = OpsButton("Start Scan")
-        self.stopBtn = OpsButton("Stop")
-        self.stopBtn.setChecked(False)
-        self.stopBtn.setEnabled(False)
-
-        for b in (self.startBtn, self.stopBtn):
-            b.setChecked(False)
-
+        self.urlEdit.setPlaceholderText("Enter base URL to crawl")
+        self.startBtn = OpsButton("Start")
         row.addWidget(self.urlEdit, 1)
-        row.addWidget(self.depthSpin)
-        row.addWidget(self.filterCombo)
         row.addWidget(self.startBtn)
-        row.addWidget(self.stopBtn)
         v.addLayout(row)
 
-        stat = QtWidgets.QHBoxLayout()
-        stat.setSpacing(8)
-        self.statusLbl = QtWidgets.QLabel("Ready")
-        self.statusLbl.setStyleSheet("color: #E8EDF5")
-        self.progress = QtWidgets.QProgressBar()
-        self.progress.setRange(0, 0)
-        self.progress.hide()
-        stat.addWidget(self.statusLbl, 0)
-        stat.addWidget(self.progress, 1)
-        v.addLayout(stat)
+        self.text = QtWidgets.QTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setStyleSheet("background:#1B222C;color:#E8EDF5;border:1px solid #2E3B4A;")
+        v.addWidget(self.text, 1)
 
-        self.view = QtWidgets.QTextEdit()
-        self.view.setReadOnly(True)
-        self.view.setStyleSheet("background:#1B222C; color:#E8EDF5; border:1px solid #2E3B4A;")
-        v.addWidget(self.view, 1)
+        self.startBtn.clicked.connect(self._start)
 
-        self.startBtn.clicked.connect(self._start_scan)
-        self.stopBtn.clicked.connect(self._stop_scan)
-        self.filterCombo.currentIndexChanged.connect(self._refresh_view)
+    def _append(self, msg, color="#E8EDF5"):
+        self.text.append("<span style='color:%s'>%s</span>" % (color, msg))
 
-    def _start_scan(self):
-        start_url = self.urlEdit.text().strip()
-        if not start_url:
-            QtWidgets.QMessageBox.critical(self, "Link Verifier", "Please enter a URL.")
+    def _start(self):
+        base = self.urlEdit.text().strip()
+        if not base:
+            QtWidgets.QMessageBox.warning(self, "Link Verifier", "Enter a URL.")
             return
-        if not start_url.startswith("http"):
-            start_url = "http://" + start_url
-            self.urlEdit.setText(start_url)
+        if not base.startswith("http"):
+            base = "http://" + base
 
-        depth = int(self.depthSpin.value())
-        self.view.clear()
-        self.results = []
-        self._stop = False
-        self.stopBtn.setEnabled(True)
-        self._setBusy("Scanning...")
+        self.text.clear()
+        threading.Thread(target=self._crawl, args=(base,), daemon=True).start()
 
-        def run():
-            try:
-                report_lines = []
-                visited = set()
-                self._add_log_line("Starting at: " + start_url)
-                self._crawl(start_url, depth, visited)
-                self._add_log_line("")
-                self._add_log_line("Scan complete. Writing report.txt ...")
-                self._write_report()
-            except Exception as e:
-                self._add_log_line("Error: " + str(e))
-            finally:
-                QtCore.QMetaObject.invokeMethod(self, "_finish", QtCore.Qt.QueuedConnection)
-
-        threading.Thread(target=run, daemon=True).start()
-
-    def _stop_scan(self):
-        self._stop = True
-        self._add_log_line("Stop requested...")
-
-    def _setBusy(self, msg):
-        self.statusLbl.setText(msg)
-        self.progress.show()
-
-    @QtCore.Slot()
-    def _finish(self):
-        self.progress.hide()
-        self.statusLbl.setText("Done")
-        self.stopBtn.setEnabled(False)
-        self._refresh_view()
-
-    def _add_log_line(self, text):
-        QtCore.QMetaObject.invokeMethod(self.view, "append", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, text))
-
-    def _fetch_links(self, url):
+    def _crawl(self, base):
         try:
-            r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code >= 400:
-                return [], r.status_code
+            r = requests.get(base, timeout=10)
             soup = BeautifulSoup(r.text, "html.parser")
-            links = []
-            for a in soup.find_all("a", href=True):
-                links.append(urljoin(url, a["href"]))
-            return links, r.status_code
-        except Exception:
-            return [], None
+            links = [urljoin(base, a.get("href")) for a in soup.find_all("a", href=True)]
+            links = list(dict.fromkeys(links))
+            self._append("Found " + str(len(links)) + " links.")
+        except Exception as e:
+            self._append("Error loading page: " + str(e), "#F27878")
+            return
 
-    def _check_link(self, url):
+        results = []
+        lock = threading.Lock()
+        q = {"i": 0}
+        total = len(links)
+
+        def worker():
+            while True:
+                with lock:
+                    if q["i"] >= total:
+                        return
+                    i = q["i"]
+                    q["i"] += 1
+                url = links[i]
+                try:
+                    r = requests.head(url, timeout=6, allow_redirects=True)
+                    code = r.status_code
+                    color = "#7FD3A2" if code < 400 else "#F27878"
+                    with lock:
+                        self._append("[%s] %s" % (code, url), color)
+                        results.append((url, code))
+                except Exception as e:
+                    with lock:
+                        self._append("[Err] %s %s" % (url, e), "#F27878")
+                        results.append((url, "Error"))
+
+        threads = []
+        for _ in range(min(10, total)):
+            t = threading.Thread(target=worker, daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+
+        report_path = os.path.join(os.getcwd(), "link_report.txt")
         try:
-            r = requests.head(url, allow_redirects=True, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
-            code = r.status_code
-            final_url = r.url
-            redirected = len(r.history) > 0
-            if code >= 400 or code == 0:
-                r = requests.get(url, stream=True, allow_redirects=True, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-                code = r.status_code
-                final_url = r.url
-                redirected = len(r.history) > 0
-            return code, final_url, redirected
-        except Exception:
-            return None, None, False
-
-    def _add_result(self, url, code, final_url, redirected):
-        if code is None:
-            category = "broken"
-        elif code >= 400:
-            category = "broken"
-        elif 300 <= code <= 399 or redirected:
-            category = "redirect"
-        elif 200 <= code <= 299:
-            category = "good"
-        else:
-            category = "skipped"
-
-        entry = {"url": url, "code": code, "category": category, "final_url": final_url or ""}
-        self.results.append(entry)
-
-        # incremental append for current filter
-        if self._should_show(entry):
-            QtCore.QMetaObject.invokeMethod(
-                self.view, "append", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, self._format_entry(entry))
-            )
-
-    def _should_show(self, entry):
-        idx = self.filterCombo.currentIndex()
-        if idx == 0:
-            return True
-        if idx == 1:
-            return entry["category"] == "broken"
-        if idx == 2:
-            return entry["category"] == "redirect"
-        if idx == 3:
-            return entry["category"] == "good"
-        if idx == 4:
-            return entry["category"] == "skipped"
-        return True
-
-    def _format_entry(self, e):
-        # color-coded HTML lines; ASCII only
-        cat = e["category"]
-        code = "None" if e["code"] is None else str(e["code"])
-        url = e["url"]
-        final_url = e["final_url"]
-        if cat == "broken":
-            color = "#F27878"
-        elif cat == "redirect":
-            color = "#E8B45D"
-        elif cat == "good":
-            color = "#7FD3A2"
-        else:
-            color = "#B8C3D1"
-        if cat == "redirect" and final_url and final_url != url:
-            tail = " -> " + final_url
-        else:
-            tail = ""
-        return "<span style='color:" + color + "'>" + code + "</span> " + url + tail
-
-    def _refresh_view(self):
-        # rebuild display from self.results using current filter
-        lines = []
-        for e in self.results:
-            if self._should_show(e):
-                lines.append(self._format_entry(e))
-        html = "\n".join(lines) if lines else "<span style='color:#B8C3D1'>No results for this filter.</span>"
-        self.view.setHtml(html)
-
-    def _crawl(self, start_url, max_depth, visited):
-        origin = urlparse(start_url)
-        base_host = origin.netloc.lower()
-
-        def crawl_one(url, depth):
-            if self._stop:
-                return
-            if url in visited:
-                self._add_log_line("SKIP " + url)
-                self.results.append({"url": url, "code": None, "category": "skipped", "final_url": ""})
-                return
-            visited.add(url)
-            code, final_url, redirected = self._check_link(url)
-            self._add_result(url, code, final_url, redirected)
-
-            if depth >= max_depth:
-                return
-
-            links, _status = self._fetch_links(url)
-            for link in links:
-                if self._stop:
-                    return
-                pr = urlparse(link)
-                if pr.scheme in ("http", "https") and pr.netloc.lower() == base_host:
-                    crawl_one(link, depth + 1)
-
-        crawl_one(start_url, 0)
-
-    def _write_report(self):
-        # Group in the required order: Broken, Redirects, Good, Skipped
-        broken = [e for e in self.results if e["category"] == "broken"]
-        redirects = [e for e in self.results if e["category"] == "redirect"]
-        good = [e for e in self.results if e["category"] == "good"]
-        skipped = [e for e in self.results if e["category"] == "skipped"]
-
-        try:
-            with open("report.txt", "w") as f:
-                f.write("[BROKEN LINKS]\n")
-                for e in broken:
-                    code = "None" if e["code"] is None else str(e["code"])
-                    f.write(code + " " + e["url"] + "\n")
-
-                f.write("\n[REDIRECTED LINKS]\n")
-                for e in redirects:
-                    code = "None" if e["code"] is None else str(e["code"])
-                    if e["final_url"] and e["final_url"] != e["url"]:
-                        f.write(code + " " + e["url"] + " -> " + e["final_url"] + "\n")
-                    else:
-                        f.write(code + " " + e["url"] + "\n")
-
-                f.write("\n[GOOD LINKS]\n")
-                for e in good:
-                    code = "None" if e["code"] is None else str(e["code"])
-                    f.write(code + " " + e["url"] + "\n")
-
-                f.write("\n[SKIPPED]\n")
-                for e in skipped:
-                    f.write("SKIP " + e["url"] + "\n")
-
-            self._add_log_line("Saved report.txt")
-        except Exception as fe:
-            self._add_log_line("Could not write report.txt: " + str(fe))
+            with open(report_path, "w") as f:
+                for url, code in results:
+                    f.write(str(code) + "\t" + url + "\n")
+            self._append("Report saved to " + report_path, "#7FD3A2")
+        except Exception as e:
+            self._append("Failed to save report: " + str(e), "#F27878")
 
 
-# ------------------------------
-# Entry Point
-# ------------------------------
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
+
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    app.setFont(QtGui.QFont("Arial", 10))
-
-    # Prompted auto-update with backup
-    check_for_updates_gui(None)
-
-    w = OpsWindow()
-    w.show()
+    win = OpsWindow()
+    win.show()
+    check_for_updates_gui(win)
     sys.exit(app.exec())
 
 
