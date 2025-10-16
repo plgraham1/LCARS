@@ -1737,84 +1737,305 @@ add_image_downloader_to_filetools()
 # ------------------------------------------------------------
 
 class BuilderPanel(QtWidgets.QWidget):
+    """
+    OneTouch Installer Builder
+    - Builds a single Windows installer (.exe) only
+    - Auto-installs Inno Setup silently if ISCC.exe not found
+    - Uses PyInstaller under the hood in a temp folder (cleaned up)
+    - Adds Start Menu + Desktop shortcuts
+    - Shows 'Run app now' checkbox at the end of install
+    """
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._build_ui()
+
+    # ----------------- UI -----------------
+    def _build_ui(self):
         v = QtWidgets.QVBoxLayout(self)
         v.setContentsMargins(12, 12, 12, 12)
         v.setSpacing(8)
 
         self.info = QtWidgets.QLabel(
-            "OneTouch Builder converts your Python app into a Windows EXE using PyInstaller.\n"
-            "Select script, optional icon, and output folder."
+            "Create a Windows installer from your Python script.\n"
+            "Select script, optional icon and requirements.txt. Output will be an installer (.exe) only."
         )
-        self.info.setStyleSheet("color:#E8EDF5;")
         v.addWidget(self.info)
 
         form = QtWidgets.QGridLayout()
-        form.setSpacing(8)
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(6)
 
         self.scriptEdit = QtWidgets.QLineEdit()
         self.iconEdit = QtWidgets.QLineEdit()
-        self.outEdit = QtWidgets.QLineEdit()
+        self.reqEdit = QtWidgets.QLineEdit()
+        self.outEdit = QtWidgets.QLineEdit(str(Path.cwd() / "dist"))
 
-        self.pickScript = OpsButton("Script")
-        self.pickIcon = OpsButton("Icon")
-        self.pickOut = OpsButton("Output")
-        self.buildBtn = OpsButton("Build")
+        bScript = OpsButton("Browse")
+        bIcon = OpsButton("Browse")
+        bReq = OpsButton("Browse")
+        bOut = OpsButton("Browse")
 
-        form.addWidget(QtWidgets.QLabel("Script:"), 0, 0)
+        form.addWidget(QtWidgets.QLabel("Script (.py):"), 0, 0)
         form.addWidget(self.scriptEdit, 0, 1)
-        form.addWidget(self.pickScript, 0, 2)
-        form.addWidget(QtWidgets.QLabel("Icon:"), 1, 0)
+        form.addWidget(bScript, 0, 2)
+
+        form.addWidget(QtWidgets.QLabel("Icon (.ico, optional):"), 1, 0)
         form.addWidget(self.iconEdit, 1, 1)
-        form.addWidget(self.pickIcon, 1, 2)
-        form.addWidget(QtWidgets.QLabel("Output:"), 2, 0)
-        form.addWidget(self.outEdit, 2, 1)
-        form.addWidget(self.pickOut, 2, 2)
+        form.addWidget(bIcon, 1, 2)
+
+        form.addWidget(QtWidgets.QLabel("requirements.txt (optional):"), 2, 0)
+        form.addWidget(self.reqEdit, 2, 1)
+        form.addWidget(bReq, 2, 2)
+
+        form.addWidget(QtWidgets.QLabel("Output folder:"), 3, 0)
+        form.addWidget(self.outEdit, 3, 1)
+        form.addWidget(bOut, 3, 2)
+
         v.addLayout(form)
 
-        v.addWidget(self.buildBtn)
-        v.addStretch(1)
+        self.buildBtn = OpsButton("Build Installer")
+        self.buildBtn.setChecked(False)
+        v.addWidget(self.buildBtn, 0, QtCore.Qt.AlignLeft)
 
-        self.pickScript.clicked.connect(self._pick_script)
-        self.pickIcon.clicked.connect(self._pick_icon)
-        self.pickOut.clicked.connect(self._pick_out)
-        self.buildBtn.clicked.connect(self._build_exe)
+        self.logView = QtWidgets.QTextEdit()
+        self.logView.setReadOnly(True)
+        self.logView.setStyleSheet("background:#1B222C; color:#E8EDF5; border:1px solid #2E3B4A;")
+        v.addWidget(self.logView, 1)
+
+        bScript.clicked.connect(self._pick_script)
+        bIcon.clicked.connect(self._pick_icon)
+        bReq.clicked.connect(self._pick_req)
+        bOut.clicked.connect(self._pick_out)
+        self.buildBtn.clicked.connect(self._start_build)
+
+    # ----------------- Helpers -----------------
+    def _log(self, msg, color="#E8EDF5"):
+        # thread-safe append
+        QtCore.QMetaObject.invokeMethod(
+            self.logView, "append", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, f"<span style='color:{color}'>{msg}</span>")
+        )
 
     def _pick_script(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select Script", "", "Python Files (*.py)")
-        if path:
-            self.scriptEdit.setText(path)
+        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select Python Script", "", "Python (*.py)")
+        if p:
+            self.scriptEdit.setText(p)
 
     def _pick_icon(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select Icon", "", "ICO Files (*.ico)")
-        if path:
-            self.iconEdit.setText(path)
+        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select Icon", "", "ICO (*.ico)")
+        if p:
+            self.iconEdit.setText(p)
+
+    def _pick_req(self):
+        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select requirements.txt", "", "Text (*.txt)")
+        if p:
+            self.reqEdit.setText(p)
 
     def _pick_out(self):
-        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Output Folder", "")
-        if path:
-            self.outEdit.setText(path)
+        p = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Output Folder", "")
+        if p:
+            self.outEdit.setText(p)
 
-    def _build_exe(self):
-        script = self.scriptEdit.text().strip()
-        outdir = self.outEdit.text().strip() or os.getcwd()
-        icon = self.iconEdit.text().strip()
-        if not script:
-            QtWidgets.QMessageBox.warning(self, "Builder", "Select a Python script first.")
+    def _safe_app_name(self, path: Path):
+        return re.sub(r"[^A-Za-z0-9_.-]", "_", path.stem)
+
+    def _find_iscc(self) -> str:
+        # Common install paths
+        candidates = [
+            r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+            r"C:\Program Files\Inno Setup 6\ISCC.exe",
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                return c
+        # PATH lookup
+        for p in os.environ.get("PATH", "").split(os.pathsep):
+            exe = os.path.join(p, "ISCC.exe")
+            if os.path.exists(exe):
+                return exe
+        return ""
+
+    def _install_inno_setup_silent(self, tmp_dir: Path) -> str:
+        # Download official installer and install silently
+        url = "https://files.jrsoftware.org/is/6/innosetup-6.2.2.exe"
+        installer = tmp_dir / "innosetup_installer.exe"
+        self._log("[*] Downloading Inno Setup ...", "#E8B45D")
+        try:
+            import requests
+            with requests.get(url, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                with open(installer, "wb") as f:
+                    for chunk in r.iter_content(8192):
+                        f.write(chunk)
+        except Exception as e:
+            raise RuntimeError(f"Failed to download Inno Setup: {e}")
+        self._log("[*] Running Inno Setup silent install ...", "#E8B45D")
+        try:
+            subprocess.check_call([str(installer), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"])
+        except Exception as e:
+            raise RuntimeError(f"Inno Setup silent install failed: {e}")
+        path = self._find_iscc()
+        if not path:
+            raise RuntimeError("Inno Setup installed but ISCC.exe not found.")
+        self._log(f"[*] Inno Setup available: {path}", "#7FD3A2")
+        return path
+
+    def _write_iss(self, app_name: str, exe_path: Path, out_dir: Path, icon_path: str) -> Path:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        iss = out_dir / f"{app_name}.iss"
+        lines = [
+            f'#define MyAppName "{app_name}"',
+            f'#define MyAppExeName "{exe_path.name}"',
+            "",
+            "[Setup]",
+            "AppName={#MyAppName}",
+            "AppVersion=1.0",
+            r"DefaultDirName={pf}\{#MyAppName}",
+            "DefaultGroupName={#MyAppName}",
+            r"UninstallDisplayIcon={app}\{#MyAppExeName}",
+            'OutputDir="' + str(out_dir).replace("\\", "\\\\") + '"',
+            "OutputBaseFilename=" + app_name + "_Installer",
+            "Compression=lzma",
+            "SolidCompression=yes",
+            f'SetupIconFile="{icon_path}"' if icon_path else "",
+            "",
+            "[Files]",
+            f'Source: "{str(exe_path)}"; DestDir: "{{app}}"; Flags: ignoreversion',
+            "",
+            "[Icons]",
+            r'Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"',
+            r'Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon',
+            "",
+            "[Tasks]",
+            r'Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked',
+            "",
+            "[Run]",
+            r'Filename: "{app}\{#MyAppExeName}"; Description: "Run {#MyAppName}"; Flags: nowait postinstall skipifsilent',
+        ]
+        iss.write_text("\n".join([l for l in lines if l.strip()]))
+        return iss
+
+    def _ensure_pip_requirements(self, req_path: str):
+        if not req_path or not os.path.exists(req_path):
+            return
+        self._log("[*] Installing dependencies from requirements.txt ...", "#E8B45D")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", req_path])
+            self._log("[*] Dependencies installed.", "#7FD3A2")
+        except Exception as e:
+            self._log("[!] Failed to install requirements (continuing): " + str(e), "#F27878")
+
+    # ----------------- Build flow -----------------
+    def _start_build(self):
+        if os.name != "nt":
+            QtWidgets.QMessageBox.critical(self, "Builder", "Windows installer can only be built on Windows.")
             return
 
-        exe = exe_name(safe_app_name(Path(script)))
-        cmd = [sys.executable, "-m", "PyInstaller", "--onefile", "-n", exe, "--distpath", outdir]
-        if icon:
-            cmd += ["--icon", icon]
-        cmd += [script]
+        script = self.scriptEdit.text().strip()
+        if not script:
+            QtWidgets.QMessageBox.critical(self, "Builder", "Please select a Python script.")
+            return
 
-        dlg = QtWidgets.QMessageBox(self)
-        dlg.setWindowTitle("Builder")
-        dlg.setText("Building executable... this may take a while.\n\nCommand:\n" + " ".join(cmd))
-        dlg.show()
-        threading.Thread(target=lambda: subprocess.call(cmd), daemon=True).start()
+        out_dir = Path(self.outEdit.text().strip() or str(Path.cwd() / "dist"))
+        icon = self.iconEdit.text().strip()
+        req = self.reqEdit.text().strip()
+
+        self.logView.clear()
+        self._log("[*] Starting OneTouch Installer build ...", "#7FD3A2")
+
+        def run():
+            try:
+                # 1) Pre-checks
+                try:
+                    import PyInstaller  # noqa: F401
+                except Exception:
+                    self._log("[*] Installing PyInstaller ...", "#E8B45D")
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", "pyinstaller"])
+
+                self._ensure_pip_requirements(req)
+
+                # 2) Temp work area
+                tmp_root = Path(tempfile.mkdtemp(prefix="builder_"))
+                work_dir = tmp_root / "work"
+                dist_dir = tmp_root / "dist"
+                build_dir = tmp_root / "build"
+                work_dir.mkdir(parents=True, exist_ok=True)
+
+                # 3) PyInstaller build (internal; not final output)
+                exe_name_final = self._safe_app_name(Path(script))
+                cmd = [
+                    sys.executable, "-m", "PyInstaller",
+                    "--onefile", "--noconfirm",
+                    f"--distpath={str(dist_dir)}",
+                    f"--workpath={str(build_dir)}",
+                    f"--name={exe_name_final}",
+                ]
+                if icon:
+                    cmd.append(f"--icon={icon}")
+                cmd.append(script)
+
+                self._log("[*] Running PyInstaller ...", "#E8B45D")
+                self._log("    " + " ".join(cmd), "#B8C3D1")
+                subprocess.check_call(cmd)
+
+                built_exe = dist_dir / (exe_name_final + ".exe")
+                if not built_exe.exists():
+                    raise RuntimeError("PyInstaller completed but EXE not found.")
+
+                # 4) Ensure Inno Setup (ISCC.exe)
+                iscc = self._find_iscc()
+                if not iscc:
+                    iscc = self._install_inno_setup_silent(tmp_root)  # download+install
+
+                # 5) Write .iss and compile installer
+                app_name = self._safe_app_name(Path(script))
+                out_dir.mkdir(parents=True, exist_ok=True)
+                iss = self._write_iss(app_name, built_exe, out_dir, icon)
+
+                self._log("[*] Compiling installer with Inno Setup ...", "#E8B45D")
+                subprocess.check_call([iscc, str(iss)], cwd=str(out_dir))
+
+                installer_path = out_dir / (app_name + "_Installer.exe")
+                if not installer_path.exists():
+                    raise RuntimeError("Inno Setup finished but installer not found.")
+
+                self._log("[+] Installer created: " + str(installer_path), "#7FD3A2")
+
+                # 6) Cleanup temp build artifacts
+                try:
+                    shutil.rmtree(tmp_root)
+                    self._log("[*] Cleaned temporary build files.", "#B8C3D1")
+                except Exception as e:
+                    self._log("[!] Cleanup warning: " + str(e), "#E8B45D")
+
+                # 7) Notify success and open folder
+                QtCore.QMetaObject.invokeMethod(self, "_notify_success",
+                    QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, str(installer_path)))
+            except Exception as e:
+                QtCore.QMetaObject.invokeMethod(self, "_notify_failure",
+                    QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, str(e)))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    @QtCore.Slot(str)
+    def _notify_success(self, installer_path):
+        QtWidgets.QMessageBox.information(self, "Builder", "Installer built:\n" + installer_path)
+        # Open the output folder
+        try:
+            if is_windows():
+                os.startfile(os.path.dirname(installer_path))
+            elif sys.platform == "darwin":
+                subprocess.call(["open", os.path.dirname(installer_path)])
+            else:
+                subprocess.call(["xdg-open", os.path.dirname(installer_path)])
+        except Exception:
+            pass
+
+    @QtCore.Slot(str)
+    def _notify_failure(self, msg):
+        QtWidgets.QMessageBox.critical(self, "Builder", "Build failed:\n" + msg)
+
+        
+
 
 
 # ------------------------------------------------------------
