@@ -41,6 +41,7 @@ import subprocess
 import tempfile
 import urllib.request
 from urllib.parse import urljoin, urlparse
+APP_VERSION = "v1.0.0"
 
 # optional Pillow for icon conversion (Builder)
 try:
@@ -535,7 +536,7 @@ class WorkArea(QtWidgets.QFrame):
 class OpsWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Unified Operations Shell")
+        self.setWindowTitle(f"Unified Operations Shell {APP_VERSION}")
         self.resize(1300, 900)
         self.setStyleSheet("background: " + OpsTheme.BG.name() + "; color: " + OpsTheme.FG.name() + ";")
 
@@ -607,6 +608,13 @@ class OpsWindow(QtWidgets.QMainWindow):
             self.work.banner._title = label
             self.work.banner._color = OpsTheme.PANEL
             self.work.banner.update()
+        
+        # Apply version number to banner and title bar
+            self.setWindowTitle(f"Unified Operations Shell {APP_VERSION}")
+            self.work.banner.setText(f"OPS SHELL  {APP_VERSION}")
+
+
+
         # Apply LCARS look and kick off intro animations
         apply_lcars_styles(QtWidgets.QApplication.instance())
         self._lcars_anim = LCARSAnimator()
