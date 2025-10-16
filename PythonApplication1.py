@@ -86,6 +86,92 @@ class OpsTheme:
     TEXT_DANGER = QtGui.QColor("#F27878")
     TEXT_OK = QtGui.QColor("#7FD3A2")
 
+# ------------------------------
+# LCARS Style + Animation (additive)
+# ------------------------------
+class LCARSPalette:
+    # LCARS pastels and dark bg
+    BG = "#0A0C0F"           # deep space
+    FG = "#F2F2F2"
+    STRIP_DARK = "#1A1E24"
+    STRIP_MID = "#24303D"
+    ACCENT_AMBER = "#F6B26B"
+    ACCENT_ORANGE = "#E69138"
+    ACCENT_BLUE = "#6FA8DC"
+    ACCENT_TEAL = "#76A5AF"
+    ACCENT_MAGENTA = "#E06666"
+    ACCENT_TAN = "#FFD966"
+
+def apply_lcars_styles(app: QtWidgets.QApplication):
+    # Global stylesheet (rounded panels, big tabs, LCARS colors)
+    app.setStyleSheet(
+        "QMainWindow { background: " + LCARSPalette.BG + "; }"
+        "QWidget { color: " + LCARSPalette.FG + "; font-family: Arial; font-size: 11pt; }"
+        "QLabel { color: " + LCARSPalette.FG + "; }"
+        "QFrame { background: " + LCARSPalette.STRIP_DARK + "; border: none; }"
+        "QTabWidget::pane { border: 2px solid " + LCARSPalette.STRIP_MID + "; background: " + LCARSPalette.BG + "; }"
+        "QTabBar::tab { background: " + LCARSPalette.STRIP_MID + "; color: " + LCARSPalette.FG + ";"
+        " padding: 8px 16px; margin-right: 6px; border-top-left-radius: 18px; border-top-right-radius: 4px; }"
+        "QTabBar::tab:selected { background: " + LCARSPalette.ACCENT_BLUE + "; color: #0b0b0b; }"
+        "QTabBar::tab:hover { background: " + LCARSPalette.ACCENT_TEAL + "; color: #0b0b0b; }"
+        "QTextEdit, QPlainTextEdit { background: " + LCARSPalette.STRIP_DARK + ";"
+        " border: 2px solid " + LCARSPalette.STRIP_MID + "; }"
+        "QLineEdit { background: " + LCARSPalette.STRIP_MID + "; border: 2px solid " + LCARSPalette.ACCENT_TEAL + ";"
+        " padding: 6px; border-radius: 8px; }"
+        "QProgressBar { background: " + LCARSPalette.STRIP_MID + "; border: 2px solid " + LCARSPalette.ACCENT_TEAL + ";"
+        " border-radius: 10px; text-align: center; }"
+        "QProgressBar::chunk { background: " + LCARSPalette.ACCENT_AMBER + "; }"
+        "QTableWidget { background: " + LCARSPalette.STRIP_DARK + "; gridline-color: " + LCARSPalette.STRIP_MID + "; }"
+        "QHeaderView::section { background: " + LCARSPalette.ACCENT_TAN + "; color: #0b0b0b; border: none; padding: 6px; }"
+        "QComboBox, QSpinBox { background: " + LCARSPalette.STRIP_MID + "; border: 2px solid " + LCARSPalette.ACCENT_TEAL + ";"
+        " padding: 4px; border-radius: 8px; }"
+    )
+
+class LCARSAnimator(QtCore.QObject):
+    """Helpers for fades, slides, and pulses."""
+    def fade_in(self, widget: QtWidgets.QWidget, msec=1200, start=0.0, end=1.0):
+        eff = QtWidgets.QGraphicsOpacityEffect(widget)
+        widget.setGraphicsEffect(eff)
+        anim = QtCore.QPropertyAnimation(eff, b"opacity", widget)
+        anim.setDuration(msec)
+        anim.setStartValue(start)
+        anim.setEndValue(end)
+        anim.setEasingCurve(QtCore.QEasingCurve.InOutQuad)
+        anim.start(QtCore.QAbstractAnimation.DeleteWhenStopped)
+
+    def slide_in(self, widget: QtWidgets.QWidget, direction="right", msec=350, dx=40, dy=0):
+        start_pos = widget.pos()
+        if direction == "right":
+            off = QtCore.QPoint(start_pos.x() + dx, start_pos.y() + dy)
+        elif direction == "left":
+            off = QtCore.QPoint(start_pos.x() - dx, start_pos.y() + dy)
+        elif direction == "down":
+            off = QtCore.QPoint(start_pos.x(), start_pos.y() + (dy or dx))
+        else:
+            off = QtCore.QPoint(start_pos.x(), start_pos.y() - (dy or dx))
+        widget.move(off)
+        anim = QtCore.QPropertyAnimation(widget, b"pos", widget)
+        anim.setDuration(msec)
+        anim.setStartValue(off)
+        anim.setEndValue(start_pos)
+        anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+        anim.start(QtCore.QAbstractAnimation.DeleteWhenStopped)
+
+    def pulse_panel(self, panel: QtWidgets.QWidget, color1=LCARSPalette.ACCENT_AMBER, color2=LCARSPalette.ACCENT_TAN, msec=1200):
+        # Animate background color by swapping stylesheet
+        timer = QtCore.QTimer(panel)
+        state = {"flip": False}
+        base_style = "background:{c}; border:none;"
+
+        def tick():
+            state["flip"] = not state["flip"]
+            c = color1 if state["flip"] else color2
+            panel.setStyleSheet(base_style.format(c=c))
+
+        timer.timeout.connect(tick)
+        timer.start(msec // 2)
+        # start with first color
+        panel.setStyleSheet(base_style.format(c=color1))
 
 # ------------------------------
 # Auto Updater (GUI, with backup)
@@ -437,6 +523,10 @@ class WorkArea(QtWidgets.QFrame):
         self.banner._color = QtGui.QColor(color)
         self.banner._title = title
         self.banner.update()
+        # LCARS slide-in on tab switch (if animator available)
+        win = self.window()
+        if hasattr(win, "_lcars_anim"):
+            win._lcars_anim.slide_in(self.stack.currentWidget(), direction="right", msec=320, dx=32)
 
 
 # ------------------------------
@@ -517,6 +607,17 @@ class OpsWindow(QtWidgets.QMainWindow):
             self.work.banner._title = label
             self.work.banner._color = OpsTheme.PANEL
             self.work.banner.update()
+        # Apply LCARS look and kick off intro animations
+        apply_lcars_styles(QtWidgets.QApplication.instance())
+        self._lcars_anim = LCARSAnimator()
+        # Fade the whole window in
+        self._lcars_anim.fade_in(self, msec=1100)
+        # Pulse the banner to simulate LCARS online
+        self._lcars_anim.pulse_panel(self.work.banner, color1=LCARSPalette.ACCENT_AMBER, color2=LCARSPalette.ACCENT_ORANGE, msec=1400)
+
+        # Slide-in animation for sidebar buttons (staggered)
+        for i, b in enumerate(self.sidebar.buttons):
+            QtCore.QTimer.singleShot(120 * i, lambda btn=b: self._lcars_anim.slide_in(btn, direction="left", msec=320, dx=28))
 
 
 # ------------------------------
